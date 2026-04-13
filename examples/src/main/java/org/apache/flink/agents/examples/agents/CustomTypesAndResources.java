@@ -113,7 +113,10 @@ public class CustomTypesAndResources {
     public static final ResourceDescriptor OLLAMA_SERVER_DESCRIPTOR =
             ResourceDescriptor.Builder.newBuilder(ResourceName.ChatModel.OLLAMA_CONNECTION)
                     .addInitialArgument("requestTimeout", 120)
-                    .addInitialArgument("endpoint", "http://localhost:11434")
+                    .addInitialArgument(
+                            "endpoint",
+                            System.getenv().getOrDefault(
+                                    "OLLAMA_ENDPOINT", "http://localhost:11434"))
                     .build();
 
     /** Data model representing a product review. */
