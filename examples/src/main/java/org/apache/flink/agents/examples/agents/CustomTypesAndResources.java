@@ -112,7 +112,7 @@ public class CustomTypesAndResources {
     // Ollama chat model connection descriptor
     public static final ResourceDescriptor OLLAMA_SERVER_DESCRIPTOR =
             ResourceDescriptor.Builder.newBuilder(ResourceName.ChatModel.OLLAMA_CONNECTION)
-                    .addInitialArgument("requestTimeout", 120)
+                    .addInitialArgument("requestTimeout", 300)
                     .addInitialArgument(
                             "endpoint",
                             System.getenv().getOrDefault(

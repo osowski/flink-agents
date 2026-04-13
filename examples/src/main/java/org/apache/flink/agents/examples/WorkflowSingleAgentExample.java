@@ -57,7 +57,7 @@ public class WorkflowSingleAgentExample {
                 AgentsExecutionEnvironment.getExecutionEnvironment(env);
 
         // limit async request to avoid overwhelming ollama server
-        agentsEnv.getConfig().set(AgentExecutionOptions.NUM_ASYNC_THREADS, 2);
+        agentsEnv.getConfig().set(AgentExecutionOptions.NUM_ASYNC_THREADS, 1);
 
         // Add Ollama chat model connection to be used by the ReviewAnalysisAgent.
         agentsEnv.addResource(
