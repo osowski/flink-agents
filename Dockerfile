@@ -14,6 +14,14 @@ RUN mv -v dist/common/target/flink-agents-dist-common-*.jar \
     mv -v examples/target/flink-agents-examples-*.jar \
           /tmp/flink-agents-examples.jar
 
+# flink-connector-files is a dependency of the examples JAR but is not bundled
+# in the confluentinc/cp-flink base image. Copy it from the Maven cache so the
+# classloader can find StreamFormat and related types at runtime.
+RUN find /root/.m2/repository/org/apache/flink/flink-connector-files \
+         -name "flink-connector-files-*.jar" \
+         ! -name "*-sources.jar" ! -name "*-tests.jar" ! -name "*-javadoc.jar" \
+    | sort | tail -1 | xargs -I{} mv -v {} /tmp/flink-connector-files.jar
+
 # Stage 2: Final Flink image with agent JARs installed
 # /opt/flink is $FLINK_HOME as defined in confluentinc/cp-flink base image
 FROM confluentinc/cp-flink:2.1.1-cp2-java21
@@ -23,3 +31,4 @@ LABEL org.opencontainers.image.revision=$GIT_SHA \
 COPY --from=builder /tmp/flink-agents-dist-common.jar         /opt/flink/usrlib/
 COPY --from=builder /tmp/flink-agents-dist-flink-2.1-thin.jar /opt/flink/usrlib/
 COPY --from=builder /tmp/flink-agents-examples.jar            /opt/flink/usrlib/
+COPY --from=builder /tmp/flink-connector-files.jar            /opt/flink/usrlib/
