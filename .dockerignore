@@ -1,0 +1,7 @@
+.git
+python/
+docs/
+.github/
+target/
+**/target/
+*.md

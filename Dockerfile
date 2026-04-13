@@ -5,16 +5,21 @@ COPY . .
 # Build examples + dist modules only; compile examples against Flink 2.1.1
 RUN mvn clean package -DskipTests -B -Dflink.version=2.1.1 -pl examples,dist/common,dist/flink-2.1 -am
 
-# Rename JARs to stable, version-independent names for predictable jarURI
-RUN mv dist/common/target/flink-agents-dist-common-*.jar \
-        /tmp/flink-agents-dist-common.jar && \
-    mv dist/flink-2.1/target/flink-agents-dist-flink-2.1-*-thin.jar \
-        /tmp/flink-agents-dist-flink-2.1-thin.jar && \
-    mv examples/target/flink-agents-examples-*.jar \
-        /tmp/flink-agents-examples.jar
+# Rename JARs to stable, version-independent names for predictable jarURI.
+# -v logs the actual matched filename for glob-match verification in CI.
+RUN mv -v dist/common/target/flink-agents-dist-common-*.jar \
+          /tmp/flink-agents-dist-common.jar && \
+    mv -v dist/flink-2.1/target/flink-agents-dist-flink-2.1-*-thin.jar \
+          /tmp/flink-agents-dist-flink-2.1-thin.jar && \
+    mv -v examples/target/flink-agents-examples-*.jar \
+          /tmp/flink-agents-examples.jar
 
 # Stage 2: Final Flink image with agent JARs installed
+# /opt/flink is $FLINK_HOME as defined in confluentinc/cp-flink base image
 FROM confluentinc/cp-flink:2.1.1-cp2-java21
-COPY --from=builder /tmp/flink-agents-dist-common.jar         $FLINK_HOME/usrlib/
-COPY --from=builder /tmp/flink-agents-dist-flink-2.1-thin.jar $FLINK_HOME/usrlib/
-COPY --from=builder /tmp/flink-agents-examples.jar            $FLINK_HOME/usrlib/
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.revision=$GIT_SHA \
+      org.opencontainers.image.source="https://github.com/osowski/flink-agents"
+COPY --from=builder /tmp/flink-agents-dist-common.jar         /opt/flink/usrlib/
+COPY --from=builder /tmp/flink-agents-dist-flink-2.1-thin.jar /opt/flink/usrlib/
+COPY --from=builder /tmp/flink-agents-examples.jar            /opt/flink/usrlib/
