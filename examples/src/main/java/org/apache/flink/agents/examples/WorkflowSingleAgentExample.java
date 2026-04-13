@@ -67,12 +67,22 @@ public class WorkflowSingleAgentExample {
 
         // Read product reviews from input_data.txt file as a streaming source.
         // Each element represents a ProductReview.
-        File inputDataFile = copyResource("input_data.txt");
+        //
+        // In Kubernetes, use the fixed path installed in the container image — this path exists
+        // on every pod (JobManager and TaskManager) so TaskManagers can open the file directly.
+        // copyResource() extracts to /tmp/ on the JobManager only and is unusable by TaskManagers
+        // in Kubernetes because they run in separate pods with isolated local filesystems.
+        // Fall back to copyResource() for local execution (single JVM, shared filesystem).
+        File k8sInputDataFile = new File("/opt/flink/usrlib/input_data.txt");
+        String inputDataPath =
+                k8sInputDataFile.exists()
+                        ? k8sInputDataFile.getAbsolutePath()
+                        : copyResource("input_data.txt").getAbsolutePath();
         DataStream<String> productReviewStream =
                 env.fromSource(
                         FileSource.forRecordStreamFormat(
                                         new TextLineInputFormat(),
-                                        new Path(inputDataFile.getAbsolutePath()))
+                                        new Path(inputDataPath))
                                 .build(),
                         WatermarkStrategy.noWatermarks(),
                         "streaming-agent-example");

@@ -32,3 +32,7 @@ COPY --from=builder /tmp/flink-agents-dist-common.jar         /opt/flink/usrlib/
 COPY --from=builder /tmp/flink-agents-dist-flink-2.1-thin.jar /opt/flink/usrlib/
 COPY --from=builder /tmp/flink-agents-examples.jar            /opt/flink/usrlib/
 COPY --from=builder /tmp/flink-connector-files.jar            /opt/flink/usrlib/
+# Install input data at a fixed path present on every pod (JobManager and TaskManager).
+# copyResource() extracts to /tmp/ on the JobManager only — unusable by TaskManagers
+# in Kubernetes because they run in separate pods with isolated filesystems.
+COPY --from=builder /build/examples/src/main/resources/input_data.txt /opt/flink/usrlib/input_data.txt
