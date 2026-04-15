@@ -441,6 +441,24 @@ public class RunnerContextImpl implements RunnerContext {
         }
     }
 
+    /**
+     * Returns the current durable call result as an array of fields for bridge consumers, or null
+     * if no persisted slot exists at the current call index.
+     */
+    public Object[] getCurrentCallResultFields() {
+        CallResult current = getCurrentCallResult();
+        if (current == null) {
+            return null;
+        }
+        return new Object[] {
+            current.getFunctionId(),
+            current.getArgsDigest(),
+            current.isPending() ? "PENDING" : current.isFailure() ? "FAILED" : "SUCCEEDED",
+            current.getResultPayload(),
+            current.getExceptionPayload()
+        };
+    }
+
     protected CallResult getCurrentCallResult() {
         mailboxThreadChecker.run();
         if (durableExecutionContext != null) {
@@ -482,8 +500,8 @@ public class RunnerContextImpl implements RunnerContext {
      *
      * @param durableCallable durable call that provides the durable execution identity and result
      *     metadata
-     * @param reconcileCallable reconcile boundary used to recover a successful outcome from a
-     *     pending durable call
+     * @param reconcileCallable reconcile boundary used to recover a terminal outcome from a pending
+     *     durable call
      * @param executionCallable concrete execution boundary for the current path when recovery
      *     starts or restarts the original durable call
      */
@@ -523,9 +541,7 @@ public class RunnerContextImpl implements RunnerContext {
                             durableExecutionContext.getCurrentCallIndex(), functionId, argsDigest));
         }
 
-        T reconcileResult = reconcileCallable.call();
-        finalizeCurrentCall(functionId, argsDigest, serializeDurableResult(reconcileResult), null);
-        return reconcileResult;
+        return executeAndFinalizeCurrentCall(functionId, argsDigest, reconcileCallable);
     }
 
     protected <T> T executeAndFinalizeCurrentCall(

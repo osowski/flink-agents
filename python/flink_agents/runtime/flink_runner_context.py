@@ -15,11 +15,12 @@
 #  See the License for the specific language governing permissions and
 # limitations under the License.
 #################################################################################
-import hashlib
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict
+from dataclasses import dataclass
+from functools import partial
+from typing import Any, Callable, Dict, Literal
 
 import cloudpickle
 from typing_extensions import override
@@ -34,8 +35,15 @@ from flink_agents.api.memory.long_term_memory import (
 from flink_agents.api.memory_object import MemoryType
 from flink_agents.api.metric_group import MetricGroup
 from flink_agents.api.resource import Resource, ResourceType
-from flink_agents.api.runner_context import AsyncExecutionResult, RunnerContext
-from flink_agents.plan.agent_plan import AgentPlan
+from flink_agents.api.runner_context import (
+    AsyncExecutionResult,
+    RunnerContext,
+)
+from flink_agents.runtime.durable_execution import (
+    _compute_args_digest,
+    _compute_function_id,
+    _validate_reconciler_callable,
+)
 from flink_agents.runtime.flink_memory_object import FlinkMemoryObject
 from flink_agents.runtime.flink_metric_group import FlinkMetricGroup
 from flink_agents.runtime.memory.internal_base_long_term_memory import (
@@ -48,6 +56,23 @@ from flink_agents.runtime.python_java_utils import _build_event_log_string
 from flink_agents.runtime.resource_cache import ResourceCache
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _PersistedCallResult:
+    function_id: str
+    args_digest: str
+    status: str
+    result_payload: bytes | None
+    exception_payload: bytes | None
+
+
+@dataclass(frozen=True)
+class _ReconcilerExecutionPlan:
+    mode: Literal["replay", "execute"]
+    callable: Callable[[], Any] | None = None
+    needs_clear: bool = False
+    needs_append_pending: bool = False
 
 
 class _DurableExecutionResult:
@@ -155,28 +180,65 @@ class _DurableAsyncExecutionResult(AsyncExecutionResult):
             return result
 
 
-def _compute_function_id(func: Callable) -> str:
-    """Compute a stable function identifier from a callable.
+class _ReconcilerDurableAsyncExecutionResult(AsyncExecutionResult):
+    """An AsyncExecutionResult that resolves reconciler state on await."""
 
-    Returns module.qualname for functions/methods.
-    """
-    module = getattr(func, "__module__", "<unknown>")
-    qualname = getattr(func, "__qualname__", getattr(func, "__name__", "<unknown>"))
-    return f"{module}.{qualname}"
+    def __init__(
+        self,
+        ctx: "FlinkRunnerContext",
+        executor: Any,
+        func: Callable,
+        args: tuple,
+        reconciler: Callable[[], Any],
+        kwargs: dict,
+    ) -> None:
+        super().__init__(executor, func, args, kwargs)
+        self._ctx = ctx
+        self._reconciler = reconciler
 
+    def __await__(self) -> Any:
+        plan = self._ctx._plan_reconciler_execution(
+            self._func,
+            self._args,
+            self._reconciler,
+            self._kwargs,
+        )
 
-def _compute_args_digest(args: tuple, kwargs: dict) -> str:
-    """Compute a stable digest of the serialized arguments.
+        if plan.mode == "replay":
+            result = self._ctx._replay_terminal_call(self._func, self._args, self._kwargs)
+            if False:
+                yield
+            return result
 
-    The digest is used to validate that the same arguments are passed
-    during recovery as during the original execution.
-    """
-    try:
-        serialized = cloudpickle.dumps((args, kwargs))
-        return hashlib.sha256(serialized).hexdigest()[:16]
-    except Exception:
-        # If serialization fails, return a fallback digest
-        return hashlib.sha256(str((args, kwargs)).encode()).hexdigest()[:16]
+        self._ctx._prepare_reconciler_execution(
+            plan,
+            self._func,
+            self._args,
+            self._kwargs,
+        )
+
+        future = self._executor.submit(plan.callable)
+        while not future.done():
+            yield
+
+        exception = None
+        result = None
+        try:
+            result = future.result()
+        except BaseException as e:
+            exception = e
+
+        self._ctx._finalize_current_call(
+            self._func,
+            self._args,
+            self._kwargs,
+            result,
+            exception,
+        )
+
+        if exception is not None:
+            raise exception
+        return result
 
 
 class FlinkRunnerContext(RunnerContext):
@@ -186,7 +248,7 @@ class FlinkRunnerContext(RunnerContext):
     durable execution support through execute() and execute_async() methods.
     """
 
-    __agent_plan: AgentPlan | None
+    __agent_plan: Any
     __ltm: InternalBaseLongTermMemory = None
 
     def __init__(
@@ -203,6 +265,8 @@ class FlinkRunnerContext(RunnerContext):
         j_runner_context : Any
             Java runner context used to synchronize data between Python and Java.
         """
+        from flink_agents.plan.agent_plan import AgentPlan
+
         self._j_runner_context = j_runner_context
         self.__agent_plan = AgentPlan.model_validate_json(agent_plan_json)
         self.__resource_cache = ResourceCache(
@@ -409,11 +473,165 @@ class FlinkRunnerContext(RunnerContext):
             if "recordCallCompletion" not in str(e):
                 logger.warning("Failed to record call completion: %s", e)
 
+    @staticmethod
+    def _serialize_call_payloads(
+        result: Any,
+        exception: BaseException | None,
+    ) -> tuple[bytes | None, bytes | None]:
+        result_payload = None if exception else cloudpickle.dumps(result)
+        exception_payload = cloudpickle.dumps(exception) if exception else None
+        return result_payload, exception_payload
+
+    def _peek_current_call_result(self) -> _PersistedCallResult | None:
+        current = self._j_runner_context.getCurrentCallResultFields()
+        if current is None:
+            return None
+
+        function_id, args_digest, status, result_payload, exception_payload = current
+        return _PersistedCallResult(
+            function_id=function_id,
+            args_digest=args_digest,
+            status=status,
+            result_payload=bytes(result_payload) if result_payload is not None else None,
+            exception_payload=(
+                bytes(exception_payload) if exception_payload is not None else None
+            ),
+        )
+
+    def _append_pending_call(self, func: Callable, args: tuple, kwargs: dict) -> None:
+        self._j_runner_context.appendPendingCall(
+            _compute_function_id(func),
+            _compute_args_digest(args, kwargs),
+        )
+
+    def _finalize_current_call(
+        self,
+        func: Callable,
+        args: tuple,
+        kwargs: dict,
+        result: Any,
+        exception: BaseException | None,
+    ) -> None:
+        function_id = _compute_function_id(func)
+        args_digest = _compute_args_digest(args, kwargs)
+        result_payload, exception_payload = self._serialize_call_payloads(
+            result,
+            exception,
+        )
+        self._j_runner_context.finalizeCurrentCall(
+            function_id,
+            args_digest,
+            result_payload,
+            exception_payload,
+        )
+
+    def _clear_call_results_from_current_index_and_persist(self) -> None:
+        self._j_runner_context.clearCallResultsFromCurrentIndexAndPersist()
+
+    def _replay_terminal_call(self, func: Callable, args: tuple, kwargs: dict) -> Any:
+        is_hit, cached_result = self._try_get_cached_result(func, args, kwargs)
+        if not is_hit:
+            err_msg = "Expected a terminal durable call result but replay did not hit"
+            raise RuntimeError(err_msg)
+        return cached_result
+
+    def _plan_reconciler_execution(
+        self,
+        func: Callable,
+        args: tuple,
+        reconciler: Callable[[], Any],
+        kwargs: dict,
+    ) -> _ReconcilerExecutionPlan:
+        function_id = _compute_function_id(func)
+        args_digest = _compute_args_digest(args, kwargs)
+        current = self._peek_current_call_result()
+        durable_call = partial(func, *args, **kwargs)
+
+        if current is None:
+            return _ReconcilerExecutionPlan(
+                "execute",
+                callable=durable_call,
+                needs_append_pending=True,
+            )
+
+        if current.function_id != function_id or current.args_digest != args_digest:
+            return _ReconcilerExecutionPlan(
+                "execute",
+                callable=durable_call,
+                needs_clear=True,
+                needs_append_pending=True,
+            )
+
+        if current.status != "PENDING":
+            return _ReconcilerExecutionPlan("replay")
+
+        return _ReconcilerExecutionPlan(
+            "execute",
+            callable=reconciler,
+        )
+
+    def _prepare_reconciler_execution(
+        self,
+        plan: _ReconcilerExecutionPlan,
+        func: Callable,
+        args: tuple,
+        kwargs: dict,
+    ) -> None:
+        if plan.needs_clear:
+            self._clear_call_results_from_current_index_and_persist()
+        if plan.needs_append_pending:
+            self._append_pending_call(func, args, kwargs)
+
+    def _execute_current_pending_call(
+        self,
+        execution_callable: Callable[[], Any],
+        func: Callable,
+        args: tuple,
+        kwargs: dict,
+    ) -> Any:
+        exception = None
+        result = None
+        try:
+            result = execution_callable()
+        except BaseException as e:
+            exception = e
+
+        self._finalize_current_call(func, args, kwargs, result, exception)
+
+        if exception is not None:
+            raise exception
+        return result
+
+    def _wrap_completion_only_func(
+        self,
+        func: Callable,
+        args: tuple,
+        kwargs: dict,
+    ) -> Callable[..., Any]:
+        def wrapped_func(*a: Any, **kw: Any) -> Any:
+            exception = None
+            result = None
+            try:
+                result = func(*a, **kw)
+            except BaseException as e:
+                exception = e
+
+            if exception:
+                raise _DurableExecutionException(
+                    func, args, kwargs, result, exception, self._record_call_completion
+                )
+            return _DurableExecutionResult(
+                func, args, kwargs, result, self._record_call_completion
+            )
+
+        return wrapped_func
+
     @override
     def durable_execute(
         self,
         func: Callable[[Any], Any],
         *args: Any,
+        reconciler: Callable[[], Any] | None = None,
         **kwargs: Any,
     ) -> Any:
         """Synchronously execute the provided function with durable execution support.
@@ -426,6 +644,26 @@ class FlinkRunnerContext(RunnerContext):
         The function is executed synchronously in the current thread, blocking
         the operator until completion.
         """
+        validated_reconciler = _validate_reconciler_callable(reconciler)
+
+        if validated_reconciler is not None:
+            plan = self._plan_reconciler_execution(
+                func,
+                args,
+                validated_reconciler,
+                kwargs,
+            )
+            if plan.mode == "replay":
+                return self._replay_terminal_call(func, args, kwargs)
+
+            self._prepare_reconciler_execution(plan, func, args, kwargs)
+            return self._execute_current_pending_call(
+                plan.callable,
+                func,
+                args,
+                kwargs,
+            )
+
         # Try to get cached result for recovery
         is_hit, cached_result = self._try_get_cached_result(func, args, kwargs)
         if is_hit:
@@ -451,6 +689,7 @@ class FlinkRunnerContext(RunnerContext):
         self,
         func: Callable[[Any], Any],
         *args: Any,
+        reconciler: Callable[[], Any] | None = None,
         **kwargs: Any,
     ) -> AsyncExecutionResult:
         """Asynchronously execute the provided function with durable execution support.
@@ -464,32 +703,30 @@ class FlinkRunnerContext(RunnerContext):
         is awaited. Fire-and-forget calls (not awaiting the result) will NOT be
         recorded and cannot be recovered.
         """
+        validated_reconciler = _validate_reconciler_callable(reconciler)
+
+        if validated_reconciler is not None:
+            return _ReconcilerDurableAsyncExecutionResult(
+                self,
+                self.executor,
+                func,
+                args,
+                validated_reconciler,
+                kwargs,
+            )
+
         # Try to get cached result for recovery
         is_hit, cached_result = self._try_get_cached_result(func, args, kwargs)
         if is_hit:
             # Return a pre-completed AsyncExecutionResult
             return _CachedAsyncExecutionResult(cached_result)
 
-        # Create a wrapper function that records completion
-        def wrapped_func(*a: Any, **kw: Any) -> Any:
-            exception = None
-            result = None
-            try:
-                result = func(*a, **kw)
-            except BaseException as e:
-                exception = e
-
-            # Note: This runs in a thread pool, so we need to be careful
-            # The actual recording will happen when the result is awaited
-            if exception:
-                raise _DurableExecutionException(
-                    func, args, kwargs, result, exception, self._record_call_completion
-                )
-            return _DurableExecutionResult(
-                func, args, kwargs, result, self._record_call_completion
-            )
-
-        return _DurableAsyncExecutionResult(self.executor, wrapped_func, args, kwargs)
+        return _DurableAsyncExecutionResult(
+            self.executor,
+            self._wrap_completion_only_func(func, args, kwargs),
+            args,
+            kwargs,
+        )
 
     @property
     @override
