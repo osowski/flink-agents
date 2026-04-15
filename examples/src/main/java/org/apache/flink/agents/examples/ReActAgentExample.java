@@ -85,7 +85,7 @@ public class ReActAgentExample {
                 AgentsExecutionEnvironment.getExecutionEnvironment(env);
 
         // limit async request to avoid overwhelming ollama server
-        agentsEnv.getConfig().set(AgentExecutionOptions.NUM_ASYNC_THREADS, 2);
+        agentsEnv.getConfig().set(AgentExecutionOptions.NUM_ASYNC_THREADS, 1);
 
         // Add Ollama chat model connection and record shipping question tool to be used
         // by the Agent.
@@ -103,14 +103,23 @@ public class ReActAgentExample {
 
         // Read product reviews from input_data.txt file as a streaming source.
         // Each element represents a ProductReview.
-
-        File inputDataFile = copyResource("input_data.txt");
+        //
+        // In Kubernetes, use the fixed path installed in the container image — this path exists
+        // on every pod (JobManager and TaskManager) so TaskManagers can open the file directly.
+        // copyResource() extracts to /tmp/ on the JobManager only and is unusable by TaskManagers
+        // in Kubernetes because they run in separate pods with isolated local filesystems.
+        // Fall back to copyResource() for local execution (single JVM, shared filesystem).
+        File k8sInputDataFile = new File("/opt/flink/usrlib/input_data.txt");
+        String inputDataPath =
+                k8sInputDataFile.exists()
+                        ? k8sInputDataFile.getAbsolutePath()
+                        : copyResource("input_data.txt").getAbsolutePath();
 
         DataStream<Row> productReviewStream =
                 env.fromSource(
                                 FileSource.forRecordStreamFormat(
                                                 new TextLineInputFormat(),
-                                                new Path(inputDataFile.getAbsolutePath()))
+                                                new Path(inputDataPath))
                                         .monitorContinuously(Duration.ofMinutes(1))
                                         .build(),
                                 WatermarkStrategy.noWatermarks(),
@@ -150,7 +159,7 @@ public class ReActAgentExample {
         return new ReActAgent(
                 ResourceDescriptor.Builder.newBuilder(ResourceName.ChatModel.OLLAMA_SETUP)
                         .addInitialArgument("connection", "ollamaChatModelConnection")
-                        .addInitialArgument("model", "qwen3:8b")
+                        .addInitialArgument("model", System.getenv().getOrDefault("OLLAMA_MODEL", "qwen3:8b"))
                         .addInitialArgument(
                                 "tools", Collections.singletonList("notifyShippingManager"))
                         .build(),
