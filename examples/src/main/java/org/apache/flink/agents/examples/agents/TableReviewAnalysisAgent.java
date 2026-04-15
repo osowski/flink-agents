@@ -79,7 +79,7 @@ public class TableReviewAnalysisAgent extends Agent {
     public static ResourceDescriptor reviewAnalysisModel() {
         return ResourceDescriptor.Builder.newBuilder(ResourceName.ChatModel.OLLAMA_SETUP)
                 .addInitialArgument("connection", "ollamaChatModelConnection")
-                .addInitialArgument("model", "qwen3:8b")
+                .addInitialArgument("model", System.getenv().getOrDefault("OLLAMA_MODEL", "qwen3:8b"))
                 .addInitialArgument("prompt", "reviewAnalysisPrompt")
                 .addInitialArgument("tools", Collections.singletonList("notifyShippingManager"))
                 .addInitialArgument("extract_reasoning", true)
