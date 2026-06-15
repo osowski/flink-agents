@@ -23,9 +23,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.apache.flink.agents.api.RetryExecutor;
-import org.apache.flink.agents.api.resource.Resource;
+import org.apache.flink.agents.api.resource.ResourceContext;
 import org.apache.flink.agents.api.resource.ResourceDescriptor;
-import org.apache.flink.agents.api.resource.ResourceType;
 import org.apache.flink.agents.api.vectorstores.BaseVectorStore;
 import org.apache.flink.agents.api.vectorstores.CollectionManageableVectorStore;
 import org.apache.flink.agents.api.vectorstores.Document;
@@ -47,24 +46,24 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Base64;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
-import java.util.function.BiFunction;
 
 /**
  * OpenSearch vector store supporting both OpenSearch Serverless (AOSS) and OpenSearch Service
  * domains, with IAM (SigV4) or basic auth.
  *
- * <p>Implements {@link CollectionManageableVectorStore} for Long-Term Memory support. Collections
- * map to OpenSearch indices. Collection metadata is stored in a dedicated {@code
- * flink_agents_collection_metadata} index.
+ * <p>Implements {@link CollectionManageableVectorStore}: collections map to OpenSearch indices.
+ * OpenSearch does not natively support attaching arbitrary metadata to an index, so this
+ * implementation does not persist any collection-level metadata — callers needing per-document
+ * attributes should put them on the documents themselves.
  *
  * <p>Supported parameters:
  *
@@ -103,7 +102,6 @@ public class OpenSearchVectorStore extends BaseVectorStore
         implements CollectionManageableVectorStore {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final String METADATA_INDEX = "flink_agents_collection_metadata";
 
     private static final int DEFAULT_GET_LIMIT = 10000;
 
@@ -124,9 +122,8 @@ public class OpenSearchVectorStore extends BaseVectorStore
     private final DefaultCredentialsProvider credentialsProvider;
     private final RetryExecutor retryExecutor;
 
-    public OpenSearchVectorStore(
-            ResourceDescriptor descriptor, BiFunction<String, ResourceType, Resource> getResource) {
-        super(descriptor, getResource);
+    public OpenSearchVectorStore(ResourceDescriptor descriptor, ResourceContext resourceContext) {
+        super(descriptor, resourceContext);
 
         this.endpoint = descriptor.getArgument("endpoint");
         if (this.endpoint == null || this.endpoint.isBlank()) {
@@ -218,60 +215,25 @@ public class OpenSearchVectorStore extends BaseVectorStore
 
     // ---- CollectionManageableVectorStore ----
 
+    /**
+     * Creates the OpenSearch index for the given collection if it does not already exist.
+     *
+     * <p>OpenSearch does not natively support attaching arbitrary metadata to an index, so any
+     * {@code metadata} key in {@code kwargs} is ignored.
+     */
     @Override
-    public Collection getOrCreateCollection(String name, Map<String, Object> metadata)
+    public void createCollectionIfNotExists(String name, Map<String, Object> kwargs)
             throws Exception {
         String idx = sanitizeIndexName(name);
         if (!indexExists(idx)) {
             createKnnIndex(idx);
         }
-        ensureMetadataIndex();
-        ObjectNode doc = MAPPER.createObjectNode();
-        doc.put("collection_name", name);
-        doc.set("metadata", MAPPER.valueToTree(metadata));
-        executeRequest("PUT", "/" + METADATA_INDEX + "/_doc/" + idx, doc.toString());
-        executeRequest("POST", "/" + METADATA_INDEX + "/_refresh", null);
-        return new Collection(name, metadata != null ? metadata : Collections.emptyMap());
     }
 
     @Override
-    @SuppressWarnings("unchecked")
-    public Collection getCollection(String name) throws Exception {
+    public void deleteCollection(String name) throws Exception {
         String idx = sanitizeIndexName(name);
-        if (!indexExists(idx)) {
-            throw new RuntimeException("Collection " + name + " not found");
-        }
-        try {
-            ensureMetadataIndex();
-            JsonNode resp = executeRequest("GET", "/" + METADATA_INDEX + "/_doc/" + idx, null);
-            if (resp.has("found") && resp.get("found").asBoolean()) {
-                Map<String, Object> meta =
-                        MAPPER.convertValue(resp.path("_source").path("metadata"), Map.class);
-                return new Collection(name, meta != null ? meta : Collections.emptyMap());
-            }
-        } catch (RuntimeException e) {
-            // metadata index may not exist yet; only ignore 404s
-            if (!e.getMessage().contains("(404)")) {
-                throw e;
-            }
-        }
-        return new Collection(name, Collections.emptyMap());
-    }
-
-    @Override
-    public Collection deleteCollection(String name) throws Exception {
-        String idx = sanitizeIndexName(name);
-        Collection col = getCollection(name);
         executeRequest("DELETE", "/" + idx, null);
-        try {
-            executeRequest("DELETE", "/" + METADATA_INDEX + "/_doc/" + idx, null);
-        } catch (RuntimeException e) {
-            // metadata doc may not exist; only ignore 404s
-            if (!e.getMessage().contains("(404)")) {
-                throw e;
-            }
-        }
-        return col;
     }
 
     private boolean indexExists(String idx) {
@@ -284,11 +246,18 @@ public class OpenSearchVectorStore extends BaseVectorStore
     }
 
     private void createKnnIndex(String idx) {
+        // Use the FAISS engine with HNSW: it supports both pre-filtered and post-filtered KNN
+        // queries (the default NMSLIB engine on AOSS does NOT support filters and rejects
+        // queries with "Engine [NMSLIB] does not support filters"), and is the recommended
+        // engine for both AOSS VECTORSEARCH collections and OpenSearch Service domains 2.x+.
         String body =
                 String.format(
                         "{\"settings\":{\"index\":{\"knn\":true}},"
                                 + "\"mappings\":{\"properties\":{\"%s\":{\"type\":\"knn_vector\","
-                                + "\"dimension\":%d},\"%s\":{\"type\":\"text\"},"
+                                + "\"dimension\":%d,"
+                                + "\"method\":{\"engine\":\"faiss\",\"name\":\"hnsw\","
+                                + "\"space_type\":\"l2\"}},"
+                                + "\"%s\":{\"type\":\"text\"},"
                                 + "\"metadata\":{\"type\":\"object\"}}}}",
                         vectorField, dims, contentField);
         try {
@@ -298,20 +267,14 @@ public class OpenSearchVectorStore extends BaseVectorStore
                 throw e;
             }
         }
-    }
-
-    private void ensureMetadataIndex() {
-        if (!indexExists(METADATA_INDEX)) {
+        if (serverless) {
+            // AOSS index creation is eventually consistent; the index returns 200 on PUT but
+            // queries against it can fail with "no such index" for ~5-30s afterward. Give the
+            // service a short window to propagate before any read/write hits the index.
             try {
-                executeRequest(
-                        "PUT",
-                        "/" + METADATA_INDEX,
-                        "{\"mappings\":{\"properties\":{\"collection_name\":{\"type\":\"keyword\"},"
-                                + "\"metadata\":{\"type\":\"object\"}}}}");
-            } catch (RuntimeException e) {
-                if (!e.getMessage().contains("resource_already_exists_exception")) {
-                    throw e;
-                }
+                Thread.sleep(15_000L);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
             }
         }
     }
@@ -334,55 +297,63 @@ public class OpenSearchVectorStore extends BaseVectorStore
     }
 
     @Override
-    public long size(@Nullable String collection) throws Exception {
-        String idx = collection != null ? sanitizeIndexName(collection) : this.index;
-        JsonNode response = executeRequest("GET", "/" + idx + "/_count", null);
-        return response.get("count").asLong();
-    }
-
-    @Override
     public List<Document> get(
-            @Nullable List<String> ids, @Nullable String collection, Map<String, Object> extraArgs)
+            @Nullable List<String> ids,
+            @Nullable String collection,
+            @Nullable Map<String, Object> filters,
+            @Nullable Integer limit,
+            Map<String, Object> extraArgs)
             throws IOException {
         String idx = collection != null ? sanitizeIndexName(collection) : this.index;
+        ObjectNode body = MAPPER.createObjectNode();
         if (ids != null && !ids.isEmpty()) {
-            ObjectNode body = MAPPER.createObjectNode();
             ArrayNode idsArray = body.putObject("query").putObject("ids").putArray("values");
             ids.forEach(idsArray::add);
             body.put("size", ids.size());
-            return parseHits(executeRequest("POST", "/" + idx + "/_search", body.toString()));
+        } else {
+            int effectiveLimit = limit != null ? limit : DEFAULT_GET_LIMIT;
+            body.put("size", effectiveLimit);
+            JsonNode filterQuery = filtersToBoolQuery(filters);
+            if (filterQuery != null) {
+                body.set("query", filterQuery);
+            } else {
+                body.putObject("query").putObject("match_all");
+            }
         }
-        int limit = DEFAULT_GET_LIMIT;
-        if (extraArgs != null && extraArgs.containsKey("limit")) {
-            limit = ((Number) extraArgs.get("limit")).intValue();
-        }
-        return parseHits(
-                executeRequest(
-                        "POST",
-                        "/" + idx + "/_search",
-                        "{\"query\":{\"match_all\":{}},\"size\":" + limit + "}"));
+        return parseHits(executeRequest("POST", "/" + idx + "/_search", body.toString()));
     }
 
     @Override
     public void delete(
-            @Nullable List<String> ids, @Nullable String collection, Map<String, Object> extraArgs)
+            @Nullable List<String> ids,
+            @Nullable String collection,
+            @Nullable Map<String, Object> filters,
+            Map<String, Object> extraArgs)
             throws IOException {
         String idx = collection != null ? sanitizeIndexName(collection) : this.index;
+        ObjectNode body = MAPPER.createObjectNode();
         if (ids != null && !ids.isEmpty()) {
-            ObjectNode body = MAPPER.createObjectNode();
             ArrayNode idsArray = body.putObject("query").putObject("ids").putArray("values");
             ids.forEach(idsArray::add);
-            executeRequest("POST", "/" + idx + "/_delete_by_query", body.toString());
         } else {
-            executeRequest(
-                    "POST", "/" + idx + "/_delete_by_query", "{\"query\":{\"match_all\":{}}}");
+            JsonNode filterQuery = filtersToBoolQuery(filters);
+            if (filterQuery != null) {
+                body.set("query", filterQuery);
+            } else {
+                body.putObject("query").putObject("match_all");
+            }
         }
-        executeRequest("POST", "/" + idx + "/_refresh", null);
+        executeRequest("POST", "/" + idx + "/_delete_by_query", body.toString());
+        refreshIfSupported(idx);
     }
 
     @Override
-    protected List<Document> queryEmbedding(
-            float[] embedding, int limit, @Nullable String collection, Map<String, Object> args) {
+    public List<Document> queryEmbedding(
+            float[] embedding,
+            int limit,
+            @Nullable String collection,
+            @Nullable Map<String, Object> filters,
+            Map<String, Object> args) {
         try {
             String idx = collection != null ? sanitizeIndexName(collection) : this.index;
             int k = (int) args.getOrDefault("k", Math.max(1, limit));
@@ -404,8 +375,14 @@ public class OpenSearchVectorStore extends BaseVectorStore
                         .putObject("method_parameters")
                         .put("ef_search", ((Number) args.get("ef_search")).intValue());
             }
-            if (args.containsKey("filter_query")) {
-                fieldQuery.set("filter", MAPPER.readTree((String) args.get("filter_query")));
+            JsonNode rawFilter =
+                    args.containsKey("filter_query")
+                            ? MAPPER.readTree((String) args.get("filter_query"))
+                            : null;
+            JsonNode dslFilter = filtersToBoolQuery(filters);
+            JsonNode combined = combineQueries(rawFilter, dslFilter);
+            if (combined != null) {
+                fieldQuery.set("filter", combined);
             }
 
             return parseHits(executeRequest("POST", "/" + idx + "/_search", body.toString()));
@@ -415,23 +392,55 @@ public class OpenSearchVectorStore extends BaseVectorStore
     }
 
     @Override
-    protected List<String> addEmbedding(
+    public void updateEmbedding(
+            List<Document> documents, @Nullable String collection, Map<String, Object> extraArgs)
+            throws IOException {
+        // OpenSearch's bulk index operation is upsert-by-id, so addEmbedding doubles as update on
+        // OpenSearch Service domains. On Amazon OpenSearch Serverless this pattern cannot work:
+        // AOSS rejects client-supplied _id in create/index operations, so the addEmbedding path
+        // below has to fall back to AOSS-generated ids. With no client-controllable id there is
+        // no way to target an existing document, and "updating" would silently insert a new copy
+        // instead, which would be worse than failing loudly.
+        if (serverless) {
+            throw new UnsupportedOperationException(
+                    "updateEmbedding is not supported on Amazon OpenSearch Serverless: AOSS does"
+                            + " not allow clients to specify document ids, so update-by-id cannot be"
+                            + " implemented. Use a provisioned OpenSearch Service domain if you need"
+                            + " in-place embedding updates.");
+        }
+        // BaseVectorStore.update() already enforces that every document carries an id, so
+        // addEmbedding will not generate new ones here.
+        addEmbedding(documents, collection, extraArgs);
+    }
+
+    @Override
+    public List<String> addEmbedding(
             List<Document> documents, @Nullable String collection, Map<String, Object> extraArgs)
             throws IOException {
         String idx = collection != null ? sanitizeIndexName(collection) : this.index;
         if (!indexExists(idx)) {
             createKnnIndex(idx);
         }
-        List<String> allIds = new ArrayList<>();
+        List<String> clientIds = new ArrayList<>();
+        // For serverless we accumulate ids returned by AOSS across batches; for provisioned
+        // domains we keep returning the client-supplied/generated ids that we sent in _bulk.
+        List<String> aossIds = serverless ? new ArrayList<>() : null;
         StringBuilder bulk = new StringBuilder();
         int bulkBytes = 0;
 
         for (Document doc : documents) {
             String id = doc.getId() != null ? doc.getId() : UUID.randomUUID().toString();
-            allIds.add(id);
+            clientIds.add(id);
 
             ObjectNode action = MAPPER.createObjectNode();
-            action.putObject("index").put("_index", idx).put("_id", id);
+            ObjectNode indexAction = action.putObject("index").put("_index", idx);
+            // Amazon OpenSearch Serverless rejects custom _id in create/index operations
+            // ("Document ID is not supported in create/index operation request"). Auto-generated
+            // ids are mandatory on AOSS, so for serverless we omit _id here and harvest the
+            // AOSS-generated ids out of the _bulk response below.
+            if (!serverless) {
+                indexAction.put("_id", id);
+            }
             String actionLine = action.toString() + "\n";
 
             ObjectNode source = MAPPER.createObjectNode();
@@ -450,7 +459,11 @@ public class OpenSearchVectorStore extends BaseVectorStore
             int entryBytes = actionLine.length() + sourceLine.length();
 
             if (bulkBytes > 0 && bulkBytes + entryBytes > maxBulkBytes) {
-                executeRequest("POST", "/_bulk", bulk.toString());
+                JsonNode resp = executeRequest("POST", "/_bulk", bulk.toString());
+                checkBulkResponse(resp);
+                if (aossIds != null) {
+                    collectBulkIds(resp, aossIds);
+                }
                 bulk.setLength(0);
                 bulkBytes = 0;
             }
@@ -460,10 +473,14 @@ public class OpenSearchVectorStore extends BaseVectorStore
         }
 
         if (bulkBytes > 0) {
-            executeRequest("POST", "/_bulk", bulk.toString());
+            JsonNode resp = executeRequest("POST", "/_bulk", bulk.toString());
+            checkBulkResponse(resp);
+            if (aossIds != null) {
+                collectBulkIds(resp, aossIds);
+            }
         }
-        executeRequest("POST", "/" + idx + "/_refresh", null);
-        return allIds;
+        refreshIfSupported(idx);
+        return aossIds != null ? aossIds : clientIds;
     }
 
     @SuppressWarnings("unchecked")
@@ -478,14 +495,129 @@ public class OpenSearchVectorStore extends BaseVectorStore
             if (source.has("metadata")) {
                 metadata = MAPPER.convertValue(source.get("metadata"), Map.class);
             }
-            docs.add(new Document(content, metadata, id));
+            JsonNode scoreNode = hit.get("_score");
+            Float score =
+                    (scoreNode == null || scoreNode.isNull()) ? null : (float) scoreNode.asDouble();
+            docs.add(new Document(content, metadata, id, null, score));
         }
         return docs;
+    }
+
+    /**
+     * Translate the unified equality-only filter DSL into an OpenSearch {@code bool/must} of {@code
+     * term} clauses against {@code metadata.<key>.keyword}, since metadata is stored under the
+     * {@code metadata} object and OpenSearch dynamic mapping exposes string fields as {@code
+     * <field>.keyword} for exact matching. Returns {@code null} when there is nothing to filter on.
+     */
+    @Nullable
+    private JsonNode filtersToBoolQuery(@Nullable Map<String, Object> filters) {
+        if (filters == null || filters.isEmpty()) {
+            return null;
+        }
+        ObjectNode root = MAPPER.createObjectNode();
+        ArrayNode must = root.putObject("bool").putArray("must");
+        for (Map.Entry<String, Object> entry : filters.entrySet()) {
+            ObjectNode termWrap = MAPPER.createObjectNode();
+            termWrap.putObject("term")
+                    .putPOJO("metadata." + entry.getKey() + ".keyword", entry.getValue());
+            must.add(termWrap);
+        }
+        return root;
+    }
+
+    /**
+     * AND together a raw filter (passed in via {@code extraArgs.filter_query}) and the translated
+     * unified-DSL filter under an outer {@code bool/must}. When only one is present it is returned
+     * as-is.
+     */
+    @Nullable
+    private JsonNode combineQueries(@Nullable JsonNode raw, @Nullable JsonNode dsl) {
+        if (raw == null) {
+            return dsl;
+        }
+        if (dsl == null) {
+            return raw;
+        }
+        ObjectNode root = MAPPER.createObjectNode();
+        ArrayNode must = root.putObject("bool").putArray("must");
+        must.add(raw);
+        must.add(dsl);
+        return root;
     }
 
     private JsonNode executeRequest(String method, String path, @Nullable String body) {
         return retryExecutor.execute(
                 () -> doExecuteRequest(method, path, body), "OpenSearchRequest");
+    }
+
+    /** SHA-256 hex of the given bytes. Required by AOSS as x-amz-content-sha256. */
+    private static String sha256Hex(byte[] data) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(data);
+            StringBuilder sb = new StringBuilder(digest.length * 2);
+            for (byte b : digest) {
+                sb.append(String.format("%02x", b));
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            throw new RuntimeException("SHA-256 not available", e);
+        }
+    }
+
+    /**
+     * The OpenSearch _bulk API returns HTTP 200 even when individual items fail (e.g. AOSS
+     * rejecting custom _id). The response has {@code errors:true} when any item failed; surface
+     * that as an exception so callers don't get silent partial-success behaviour.
+     */
+    private static void checkBulkResponse(JsonNode resp) {
+        if (resp != null && resp.has("errors") && resp.get("errors").asBoolean()) {
+            String firstError = "unknown";
+            JsonNode items = resp.path("items");
+            if (items.isArray()) {
+                for (JsonNode it : items) {
+                    JsonNode err = it.path("index").path("error");
+                    if (!err.isMissingNode()) {
+                        firstError = err.toString();
+                        break;
+                    }
+                }
+            }
+            throw new RuntimeException("OpenSearch _bulk had errors. First: " + firstError);
+        }
+    }
+
+    /**
+     * Extract the {@code _id} from each {@code items[].index} entry of a successful {@code _bulk}
+     * response and append to {@code out}. Used on AOSS where ids are server-generated and the
+     * caller of {@code add()} needs them in order to later {@code get}/{@code delete} the
+     * documents. Caller must invoke {@link #checkBulkResponse(JsonNode)} first.
+     */
+    private static void collectBulkIds(JsonNode resp, List<String> out) {
+        if (resp == null) {
+            return;
+        }
+        JsonNode items = resp.path("items");
+        if (!items.isArray()) {
+            return;
+        }
+        for (JsonNode it : items) {
+            JsonNode idNode = it.path("index").path("_id");
+            if (!idNode.isMissingNode() && !idNode.isNull()) {
+                out.add(idNode.asText());
+            }
+        }
+    }
+
+    /**
+     * Refreshes the index if the underlying service supports it. Amazon OpenSearch Serverless does
+     * NOT expose the {@code _refresh} API and returns 404 — for AOSS we rely on the service's
+     * eventual-consistency window (~1-30s) instead.
+     */
+    private void refreshIfSupported(String idx) {
+        if (serverless) {
+            return;
+        }
+        executeRequest("POST", "/" + idx + "/_refresh", null);
     }
 
     private static boolean isRetryableStatus(Exception e) {
@@ -504,8 +636,17 @@ public class OpenSearchVectorStore extends BaseVectorStore
                             .putHeader("Content-Type", "application/json");
 
             if (body != null) {
-                reqBuilder.contentStreamProvider(
-                        () -> new ByteArrayInputStream(body.getBytes(StandardCharsets.UTF_8)));
+                byte[] bodyBytes = body.getBytes(StandardCharsets.UTF_8);
+                reqBuilder.contentStreamProvider(() -> new ByteArrayInputStream(bodyBytes));
+                // Amazon OpenSearch Serverless requires both Content-Length and
+                // x-amz-content-sha256 on signed write requests. The legacy Aws4Signer
+                // does not populate them when the body is supplied via
+                // contentStreamProvider, so we set them explicitly. OpenSearch Service
+                // domains accept the request with or without these headers.
+                reqBuilder.putHeader("Content-Length", String.valueOf(bodyBytes.length));
+                if (useIamAuth) {
+                    reqBuilder.putHeader("x-amz-content-sha256", sha256Hex(bodyBytes));
+                }
             }
 
             SdkHttpFullRequest request;

@@ -19,9 +19,8 @@
 package org.apache.flink.agents.integrations.vectorstores.s3vectors;
 
 import org.apache.flink.agents.api.RetryExecutor;
-import org.apache.flink.agents.api.resource.Resource;
+import org.apache.flink.agents.api.resource.ResourceContext;
 import org.apache.flink.agents.api.resource.ResourceDescriptor;
-import org.apache.flink.agents.api.resource.ResourceType;
 import org.apache.flink.agents.api.vectorstores.BaseVectorStore;
 import org.apache.flink.agents.api.vectorstores.Document;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
@@ -47,7 +46,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.function.BiFunction;
 
 /**
  * Amazon S3 Vectors vector store for flink-agents.
@@ -87,9 +85,8 @@ public class S3VectorsVectorStore extends BaseVectorStore {
     private final String vectorIndex;
     private final RetryExecutor retryExecutor;
 
-    public S3VectorsVectorStore(
-            ResourceDescriptor descriptor, BiFunction<String, ResourceType, Resource> getResource) {
-        super(descriptor, getResource);
+    public S3VectorsVectorStore(ResourceDescriptor descriptor, ResourceContext resourceContext) {
+        super(descriptor, resourceContext);
 
         this.vectorBucket = descriptor.getArgument("vector_bucket");
         if (this.vectorBucket == null || this.vectorBucket.isBlank()) {
@@ -157,19 +154,13 @@ public class S3VectorsVectorStore extends BaseVectorStore {
         return m;
     }
 
-    /**
-     * S3 Vectors does not support a count operation.
-     *
-     * @throws UnsupportedOperationException always
-     */
-    @Override
-    public long size(@Nullable String collection) {
-        throw new UnsupportedOperationException("S3 Vectors does not support count operations");
-    }
-
     @Override
     public List<Document> get(
-            @Nullable List<String> ids, @Nullable String collection, Map<String, Object> extraArgs)
+            @Nullable List<String> ids,
+            @Nullable String collection,
+            @Nullable Map<String, Object> filters,
+            @Nullable Integer limit,
+            Map<String, Object> extraArgs)
             throws IOException {
         if (ids == null || ids.isEmpty()) {
             throw new UnsupportedOperationException(
@@ -188,14 +179,18 @@ public class S3VectorsVectorStore extends BaseVectorStore {
 
         List<Document> docs = new ArrayList<>();
         for (GetOutputVector v : response.vectors()) {
-            docs.add(toDocument(v.key(), v.metadata()));
+            // GetVectors has no relevance score; leave Document.score null.
+            docs.add(toDocument(v.key(), v.metadata(), null));
         }
         return docs;
     }
 
     @Override
     public void delete(
-            @Nullable List<String> ids, @Nullable String collection, Map<String, Object> extraArgs)
+            @Nullable List<String> ids,
+            @Nullable String collection,
+            @Nullable Map<String, Object> filters,
+            Map<String, Object> extraArgs)
             throws IOException {
         if (ids == null || ids.isEmpty()) {
             throw new UnsupportedOperationException(
@@ -211,8 +206,12 @@ public class S3VectorsVectorStore extends BaseVectorStore {
     }
 
     @Override
-    protected List<Document> queryEmbedding(
-            float[] embedding, int limit, @Nullable String collection, Map<String, Object> args) {
+    public List<Document> queryEmbedding(
+            float[] embedding,
+            int limit,
+            @Nullable String collection,
+            @Nullable Map<String, Object> filters,
+            Map<String, Object> args) {
         try {
             String idx = collection != null ? collection : vectorIndex;
             int topK = (int) args.getOrDefault("top_k", Math.max(1, limit));
@@ -222,19 +221,24 @@ public class S3VectorsVectorStore extends BaseVectorStore {
                 queryVector.add(v);
             }
 
-            QueryVectorsResponse response =
-                    client.queryVectors(
-                            QueryVectorsRequest.builder()
-                                    .vectorBucketName(vectorBucket)
-                                    .indexName(idx)
-                                    .queryVector(VectorData.fromFloat32(queryVector))
-                                    .topK(topK)
-                                    .returnMetadata(true)
-                                    .build());
+            QueryVectorsRequest.Builder builder =
+                    QueryVectorsRequest.builder()
+                            .vectorBucketName(vectorBucket)
+                            .indexName(idx)
+                            .queryVector(VectorData.fromFloat32(queryVector))
+                            .topK(topK)
+                            .returnMetadata(true)
+                            .returnDistance(true);
+            software.amazon.awssdk.core.document.Document filterDoc = filtersToAwsDocument(filters);
+            if (filterDoc != null) {
+                builder.filter(filterDoc);
+            }
+
+            QueryVectorsResponse response = client.queryVectors(builder.build());
 
             List<Document> docs = new ArrayList<>();
             for (QueryOutputVector v : response.vectors()) {
-                docs.add(toDocument(v.key(), v.metadata()));
+                docs.add(toDocument(v.key(), v.metadata(), v.distance()));
             }
             return docs;
         } catch (Exception e) {
@@ -243,7 +247,7 @@ public class S3VectorsVectorStore extends BaseVectorStore {
     }
 
     @Override
-    protected List<String> addEmbedding(
+    public List<String> addEmbedding(
             List<Document> documents, @Nullable String collection, Map<String, Object> extraArgs)
             throws IOException {
         String idx = collection != null ? collection : vectorIndex;
@@ -316,7 +320,9 @@ public class S3VectorsVectorStore extends BaseVectorStore {
     }
 
     private Document toDocument(
-            String key, software.amazon.awssdk.core.document.Document metadata) {
+            String key,
+            software.amazon.awssdk.core.document.Document metadata,
+            @Nullable Float score) {
         Map<String, Object> metaMap = new HashMap<>();
         String content = "";
         if (metadata != null && metadata.isMap()) {
@@ -329,6 +335,37 @@ public class S3VectorsVectorStore extends BaseVectorStore {
                             });
             content = metaMap.getOrDefault("source_text", "").toString();
         }
-        return new Document(content, metaMap, key);
+        return new Document(content, metaMap, key, null, score);
+    }
+
+    /**
+     * Translate the unified equality-only filter DSL into the S3 Vectors metadata filter document,
+     * which is itself a flat map of {@code key -> value}. Returns {@code null} when there is
+     * nothing to filter on so callers can skip the filter clause entirely.
+     */
+    @Nullable
+    private static software.amazon.awssdk.core.document.Document filtersToAwsDocument(
+            @Nullable Map<String, Object> filters) {
+        if (filters == null || filters.isEmpty()) {
+            return null;
+        }
+        Map<String, software.amazon.awssdk.core.document.Document> doc = new LinkedHashMap<>();
+        filters.forEach(
+                (k, v) ->
+                        doc.put(
+                                k,
+                                software.amazon.awssdk.core.document.Document.fromString(
+                                        String.valueOf(v))));
+        return software.amazon.awssdk.core.document.Document.fromMap(doc);
+    }
+
+    @Override
+    public void updateEmbedding(
+            List<Document> documents, @Nullable String collection, Map<String, Object> extraArgs)
+            throws IOException {
+        // S3 Vectors PutVectors is upsert-by-key, so the addEmbedding path doubles as update.
+        // BaseVectorStore.update() already enforces that every Document carries an id, so
+        // addEmbedding will not generate keys here.
+        addEmbedding(documents, collection, extraArgs);
     }
 }

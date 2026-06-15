@@ -26,6 +26,7 @@ import org.apache.flink.agents.api.annotation.Action;
 import org.apache.flink.agents.api.context.RunnerContext;
 import org.apache.flink.agents.api.prompt.Prompt;
 import org.apache.flink.agents.api.resource.Resource;
+import org.apache.flink.agents.api.resource.ResourceContext;
 import org.apache.flink.agents.api.resource.ResourceDescriptor;
 import org.apache.flink.agents.api.resource.ResourceName;
 import org.apache.flink.agents.api.resource.ResourceType;
@@ -79,7 +80,7 @@ class AgentPlanDeclareMCPServerTest {
                     .build();
         }
 
-        @Action(listenEvents = {InputEvent.class})
+        @Action(listenEventTypes = {InputEvent.EVENT_TYPE})
         public void process(Event event, RunnerContext ctx) {
             // no-op
         }
@@ -192,9 +193,11 @@ class AgentPlanDeclareMCPServerTest {
                 .get(type)
                 .get(name)
                 .provide(
-                        (n, t) -> {
-                            throw new UnsupportedOperationException("No dependencies expected");
-                        });
+                        ResourceContext.fromGetResource(
+                                (n, t) -> {
+                                    throw new UnsupportedOperationException(
+                                            "No dependencies expected");
+                                }));
     }
 
     @AfterAll

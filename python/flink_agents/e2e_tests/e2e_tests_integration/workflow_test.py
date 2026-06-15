@@ -17,7 +17,7 @@
 #################################################################################
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from pydantic import BaseModel
 
@@ -33,13 +33,31 @@ if TYPE_CHECKING:
 current_dir = Path(__file__).parent
 
 
-class ProcessedData(BaseModel):  # noqa D101
+class ProcessedData(BaseModel):
     content: str
     visit_count: int
 
 
-class MyEvent(Event):  # noqa D101
-    value: Any
+class MyEvent(Event):
+    EVENT_TYPE: ClassVar[str] = "_my_event"
+
+    def __init__(self, value: Any) -> None:
+        """Create a MyEvent with the given value."""
+        super().__init__(
+            type=MyEvent.EVENT_TYPE,
+            attributes={"value": value},
+        )
+
+    @classmethod
+    def from_event(cls, event: "Event") -> "MyEvent":
+        """Reconstruct a MyEvent from a generic Event."""
+        assert "value" in event.attributes, "Missing 'value' in event attributes"
+        return cls(value=event.attributes["value"])
+
+    @property
+    def value(self) -> Any:
+        """Return the event value."""
+        return self.attributes["value"]
 
 
 # TODO: Replace this agent with more practical example.
@@ -50,20 +68,21 @@ class MyAgent(Agent):
     validation.
     """
 
-    @action(InputEvent)
+    @action(InputEvent.EVENT_TYPE)
     @staticmethod
-    def first_action(event: Event, ctx: RunnerContext):  # noqa D102
+    def first_action(event: Event, ctx: RunnerContext) -> None:
         key = ctx.key
-        input_message = event.input
+        input_message = InputEvent.from_event(event).input
         memory = ctx.short_term_memory
 
         data_path = f"user_data.{key}"
-        previous_data: ProcessedData = memory.get(data_path)
+        stored = memory.get(data_path)
+        previous_data = ProcessedData.model_validate(stored) if stored else None
         current_count = previous_data.visit_count if previous_data else 0
         new_count = current_count + 1
 
         data_to_store = ProcessedData(content=input_message, visit_count=new_count)
-        data_ref = memory.set(data_path, data_to_store)
+        data_ref = memory.set(data_path, data_to_store.model_dump(mode="json"))
 
         ctx.send_event(MyEvent(value=data_ref))
 
@@ -71,13 +90,13 @@ class MyAgent(Agent):
         key_with_count = f"(visit {new_count} times)"
         ctx.send_event(OutputEvent(output={key_with_count: processed_content}))
 
-    @action(MyEvent)
+    @action(MyEvent.EVENT_TYPE)
     @staticmethod
-    def second_action(event: Event, ctx: RunnerContext):  # noqa D102
-        content_ref: MemoryRef = event.value
+    def second_action(event: Event, ctx: RunnerContext) -> None:
+        content_ref: MemoryRef = MyEvent.from_event(event).value
         memory = ctx.short_term_memory
 
-        processed_data: ProcessedData = memory.get(content_ref)
+        processed_data = ProcessedData.model_validate(memory.get(content_ref))
 
         base_message = processed_data.content
         current_count = processed_data.visit_count
@@ -86,14 +105,14 @@ class MyAgent(Agent):
         updated_data_to_store = ProcessedData(
             content=base_message, visit_count=new_count
         )
-        memory.set(content_ref.path, updated_data_to_store)
+        memory.set(content_ref.path, updated_data_to_store.model_dump(mode="json"))
 
         final_content = f"{base_message} -> processed by second_action"
         key_with_count = f"(visit {new_count} times)"
         ctx.send_event(OutputEvent(output={key_with_count: final_content}))
 
 
-def test_workflow() -> None:  # noqa: D103
+def test_workflow() -> None:
     env = AgentsExecutionEnvironment.get_execution_environment()
 
     input_list = []

@@ -18,6 +18,7 @@
 
 package org.apache.flink.agents.integration.test;
 
+import org.apache.flink.agents.api.Event;
 import org.apache.flink.agents.api.InputEvent;
 import org.apache.flink.agents.api.OutputEvent;
 import org.apache.flink.agents.api.agents.Agent;
@@ -90,6 +91,16 @@ public class ChatModelIntegrationAgent extends Agent {
                             ResourceName.ChatModel.OPENAI_RESPONSES_CONNECTION)
                     .addInitialArgument("api_key", System.getenv().get("OPENAI_API_KEY"))
                     .build();
+        } else if (provider.equals("AZURE_OPENAI")) {
+            return ResourceDescriptor.Builder.newBuilder(
+                            ResourceName.ChatModel.AZURE_OPENAI_CONNECTION)
+                    .addInitialArgument("api_key", System.getenv().get("AZURE_OPENAI_API_KEY"))
+                    .addInitialArgument(
+                            "api_version", System.getenv().get("AZURE_OPENAI_API_VERSION"))
+                    .addInitialArgument(
+                            "azure_endpoint", System.getenv().get("AZURE_OPENAI_ENDPOINT"))
+                    .addInitialArgument("azure_url_path_mode", "LEGACY")
+                    .build();
         } else if (provider.equals("ANTHROPIC")) {
             String apiKey = System.getenv().get("ANTHROPIC_API_KEY");
             return ResourceDescriptor.Builder.newBuilder(
@@ -149,6 +160,14 @@ public class ChatModelIntegrationAgent extends Agent {
                             "tools",
                             List.of("calculateBMI", "convertTemperature", "createRandomNumber"))
                     .build();
+        } else if (provider.equals("AZURE_OPENAI")) {
+            return ResourceDescriptor.Builder.newBuilder(ResourceName.ChatModel.AZURE_OPENAI_SETUP)
+                    .addInitialArgument("connection", "chatModelConnection")
+                    .addInitialArgument("model", System.getenv().get("AZURE_OPENAI_DEPLOYMENT"))
+                    .addInitialArgument(
+                            "tools",
+                            List.of("calculateBMI", "convertTemperature", "createRandomNumber"))
+                    .build();
         } else {
             throw new RuntimeException(String.format("Unknown model provider %s", provider));
         }
@@ -198,17 +217,20 @@ public class ChatModelIntegrationAgent extends Agent {
         return Math.random();
     }
 
-    @Action(listenEvents = {InputEvent.class})
-    public static void process(InputEvent event, RunnerContext ctx) throws Exception {
+    @Action(listenEventTypes = {InputEvent.EVENT_TYPE})
+    public static void process(Event event, RunnerContext ctx) throws Exception {
+        InputEvent inputEvent = InputEvent.fromEvent(event);
         ctx.sendEvent(
                 new ChatRequestEvent(
                         "chatModel",
                         Collections.singletonList(
-                                new ChatMessage(MessageRole.USER, (String) event.getInput()))));
+                                new ChatMessage(
+                                        MessageRole.USER, (String) inputEvent.getInput()))));
     }
 
-    @Action(listenEvents = {ChatResponseEvent.class})
-    public static void processChatResponse(ChatResponseEvent event, RunnerContext ctx) {
-        ctx.sendEvent(new OutputEvent(event.getResponse().getContent()));
+    @Action(listenEventTypes = {ChatResponseEvent.EVENT_TYPE})
+    public static void processChatResponse(Event event, RunnerContext ctx) {
+        ChatResponseEvent chatResponse = ChatResponseEvent.fromEvent(event);
+        ctx.sendEvent(new OutputEvent(chatResponse.getResponse().getContent()));
     }
 }

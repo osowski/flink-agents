@@ -1,6 +1,6 @@
 ---
 title: Embedding Models
-weight: 5
+weight: 6
 type: docs
 ---
 <!--
@@ -129,14 +129,15 @@ class MyAgent(Agent):
             model="your-embedding-model-here"
         )
 
-    @action(InputEvent)
+    @action(InputEvent.EVENT_TYPE)
     @staticmethod
-    def process_text(event: InputEvent, ctx: RunnerContext) -> None:
+    def process_text(event: Event, ctx: RunnerContext) -> None:
         # Get the embedding model from the runtime context
         embedding_model = ctx.get_resource("openai_embedding", ResourceType.EMBEDDING_MODEL)
 
         # Use the embedding model to generate embeddings
-        user_query = str(event.input)
+        input_event = InputEvent.from_event(event)
+        user_query = str(input_event.input)
         embedding = embedding_model.embed(user_query)
 
         # Handle the embedding
@@ -164,16 +165,17 @@ public class MyAgent extends Agent {
                 .build();
     }
 
-    @Action(listenEvents = {InputEvent.class})
-    public static void processText(InputEvent event, RunnerContext ctx)
+    @Action(listenEventTypes = {InputEvent.EVENT_TYPE})
+    public static void processText(Event event, RunnerContext ctx)
             throws Exception {
+        InputEvent inputEvent = InputEvent.fromEvent(event);
         // Get the embedding model from the runtime context
         BaseEmbeddingModelSetup embeddingModel =
                 (BaseEmbeddingModelSetup)
                         ctx.getResource("embeddingModel", ResourceType.EMBEDDING_MODEL);
 
         // Use the embedding model to generate embeddings
-        String input = (String) event.getInput();
+        String input = (String) inputEvent.getInput();
         float[] embedding = embeddingModel.embed(input);
 
         // Handle the embedding
@@ -186,6 +188,99 @@ public class MyAgent extends Agent {
 {{< /tabs >}}
 
 ## Built-in Providers
+
+### Amazon Bedrock
+
+Amazon Bedrock provides embedding capabilities through the Amazon Titan Text Embeddings V2 model via the [InvokeModel API](https://docs.aws.amazon.com/bedrock/latest/userguide/titan-embedding-models.html). The integration supports configurable output dimensions (256, 512, or 1024) and parallelizes batch embedding via a configurable thread pool, since the Titan V2 model processes one text per API call. Authentication is handled via SigV4 using the AWS default credentials chain.
+
+{{< hint info >}}
+Amazon Bedrock embedding models are only supported in Java currently. To use Amazon Bedrock embeddings from Python agents, see [Using Cross-Language Providers](#using-cross-language-providers).
+{{< /hint >}}
+
+#### Prerequisites
+
+1. An AWS account with [Amazon Bedrock model access](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html) enabled for Amazon Titan Text Embeddings V2
+2. IAM credentials configured via any method supported by the [AWS Default Credentials Provider](https://docs.aws.amazon.com/sdk-for-java/latest/developer-guide/credentials-chain.html)
+
+#### BedrockEmbeddingModelConnection Parameters
+
+{{< tabs "BedrockEmbeddingModelConnection Parameters" >}}
+
+{{< tab "Java" >}}
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `region` | String | `"us-east-1"` | AWS region for the Bedrock service |
+| `model` | String | `"amazon.titan-embed-text-v2:0"` | Default embedding model ID |
+| `embed_concurrency` | int | `4` | Thread pool size for parallel batch embedding |
+| `max_retries` | int | `5` | Maximum number of API retry attempts (retries on throttling, 429, 503) |
+
+{{< /tab >}}
+
+{{< /tabs >}}
+
+#### BedrockEmbeddingModelSetup Parameters
+
+{{< tabs "BedrockEmbeddingModelSetup Parameters" >}}
+
+{{< tab "Java" >}}
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `connection` | String | Required | Reference to connection method name |
+| `model` | String | None | Override the default embedding model from the connection |
+| `dimensions` | int | None | Output embedding dimensions: 256, 512, or 1024 |
+
+{{< /tab >}}
+
+{{< /tabs >}}
+
+#### Usage Example
+
+{{< tabs "Amazon Bedrock Embedding Usage Example" >}}
+
+{{< tab "Java" >}}
+```java
+public class MyAgent extends Agent {
+
+    @EmbeddingModelConnection
+    public static ResourceDescriptor bedrockEmbeddingConnection() {
+        return ResourceDescriptor.Builder.newBuilder(ResourceName.EmbeddingModel.BEDROCK_CONNECTION)
+                .addInitialArgument("region", "us-east-1")
+                .addInitialArgument("embed_concurrency", 8)
+                .build();
+    }
+
+    @EmbeddingModelSetup
+    public static ResourceDescriptor bedrockEmbedding() {
+        return ResourceDescriptor.Builder.newBuilder(ResourceName.EmbeddingModel.BEDROCK_SETUP)
+                .addInitialArgument("connection", "bedrockEmbeddingConnection")
+                .addInitialArgument("model", "amazon.titan-embed-text-v2:0")
+                .addInitialArgument("dimensions", 1024)
+                .build();
+    }
+
+    ...
+}
+```
+{{< /tab >}}
+
+{{< /tabs >}}
+
+#### Available Models
+
+The Bedrock embedding integration currently supports:
+- **Amazon Titan Text Embeddings V2** (`amazon.titan-embed-text-v2:0`): supports 256, 512, or 1024 dimensions
+
+{{< hint info >}}
+The integration always requests **normalized** embeddings (unit vectors), which makes cosine similarity equivalent to dot product. If you need raw, un-normalized vectors, use a custom provider.
+{{< /hint >}}
+
+Visit the [Amazon Bedrock Embedding Models documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/titan-embedding-models.html) for the latest information.
+
+{{< hint warning >}}
+Model availability varies by AWS region and requires explicit model access enablement in the Bedrock console. Always check the [Amazon Bedrock documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/models-regions.html) for regional availability before implementing in production.
+{{< /hint >}}
 
 ### Ollama
 
@@ -471,7 +566,6 @@ Flink Agents supports cross-language embedding model integration, allowing you t
 - Cross-language resources are currently supported only when [running in Flink]({{< ref "docs/operations/deployment#run-in-flink" >}}), not in local development mode
 - Complex object serialization between languages may have limitations
 {{< /hint >}}
-
 ### How To Use
 
 To leverage embedding model supports provided in a different language, you need to declare the resource within a built-in cross-language wrapper, and specify the target provider as an argument:
@@ -518,12 +612,13 @@ class MyAgent(Agent):
             model="nomic-embed-text"
         )
 
-    @action(InputEvent)
+    @action(InputEvent.EVENT_TYPE)
     @staticmethod
-    def process_input(event: InputEvent, ctx: RunnerContext) -> None:
+    def process_input(event: Event, ctx: RunnerContext) -> None:
         # Use the Java embedding model from Python
+        input_event = InputEvent.from_event(event)
         embedding_model = ctx.get_resource("java_embedding_model", ResourceType.EMBEDDING_MODEL)
-        embedding = embedding_model.embed(str(event.input))
+        embedding = embedding_model.embed(str(input_event.input))
         # Process the embedding vector as needed
 ```
 
@@ -562,14 +657,15 @@ public class MyAgent extends Agent {
                 .build();
     }
 
-    @Action(listenEvents = {InputEvent.class})
-    public static void processInput(InputEvent event, RunnerContext ctx) throws Exception {
+    @Action(listenEventTypes = {InputEvent.EVENT_TYPE})
+    public static void processInput(Event event, RunnerContext ctx) throws Exception {
+        InputEvent inputEvent = InputEvent.fromEvent(event);
         // Use the Python embedding model from Java
         BaseEmbeddingModelSetup embeddingModel = 
             (BaseEmbeddingModelSetup) ctx.getResource(
                 "pythonEmbeddingModel", 
                 ResourceType.EMBEDDING_MODEL);
-        float[] embedding = embeddingModel.embed((String) event.getInput());
+        float[] embedding = embeddingModel.embed((String) inputEvent.getInput());
         // Process the embedding vector as needed
     }
 }

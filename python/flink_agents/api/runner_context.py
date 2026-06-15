@@ -24,6 +24,8 @@ from flink_agents.api.memory.long_term_memory import BaseLongTermMemory
 from flink_agents.api.metric_group import MetricGroup
 from flink_agents.api.resource import Resource, ResourceType
 
+__all__ = ["AsyncExecutionResult", "RunnerContext"]
+
 if TYPE_CHECKING:
     from flink_agents.api.memory_object import MemoryObject
 
@@ -37,7 +39,9 @@ class AsyncExecutionResult:
     and `asyncio.sleep` are NOT supported because there is no asyncio event loop.
     """
 
-    def __init__(self, executor: Any, func: Callable, args: tuple, kwargs: dict) -> None:
+    def __init__(
+        self, executor: Any, func: Callable, args: tuple, kwargs: dict
+    ) -> None:
         """Initialize an AsyncExecutionResult.
 
         Parameters
@@ -86,11 +90,13 @@ class RunnerContext(ABC):
         Parameters
         ----------
         event : Event
-            The event to be processed by the agent system.
+            The event to be sent.
         """
 
     @abstractmethod
-    def get_resource(self, name: str, type: ResourceType, metric_group: MetricGroup = None) -> Resource:
+    def get_resource(
+        self, name: str, type: ResourceType, metric_group: MetricGroup = None
+    ) -> Resource:
         """Get resource from context.
 
         Parameters

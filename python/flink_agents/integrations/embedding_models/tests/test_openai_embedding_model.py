@@ -16,24 +16,26 @@
 # limitations under the License.
 ################################################################################
 import os
+from unittest.mock import MagicMock
 
 import pytest
 
 from flink_agents.api.resource import Resource, ResourceType
+from flink_agents.api.resource_context import ResourceContext
 from flink_agents.integrations.embedding_models.openai_embedding_model import (
     OpenAIEmbeddingModelConnection,
     OpenAIEmbeddingModelSetup,
 )
+
+pytestmark = pytest.mark.integration
 
 test_model = os.environ.get("TEST_EMBEDDING_MODEL", "text-embedding-3-small")
 api_key = os.environ.get("TEST_API_KEY")
 
 
 @pytest.mark.skipif(api_key is None, reason="TEST_API_KEY is not set")
-def test_openai_embedding_model() -> None:  # noqa: D103
-    connection = OpenAIEmbeddingModelConnection(
-        name="openai", api_key=api_key
-    )
+def test_openai_embedding_model() -> None:
+    connection = OpenAIEmbeddingModelConnection(name="openai", api_key=api_key)
 
     def get_resource(name: str, type: ResourceType) -> Resource:
         if type == ResourceType.EMBEDDING_MODEL_CONNECTION:
@@ -42,9 +44,13 @@ def test_openai_embedding_model() -> None:  # noqa: D103
             msg = f"Unknown resource type: {type}"
             raise ValueError(msg)
 
+    mock_ctx = MagicMock(spec=ResourceContext)
+    mock_ctx.get_resource = get_resource
+
     embedding_model = OpenAIEmbeddingModelSetup(
-        name="openai", model=test_model, connection="openai", get_resource=get_resource
+        name="openai", model=test_model, connection="openai", resource_context=mock_ctx
     )
+    embedding_model.open()
 
     response = embedding_model.embed("Hello, Flink Agent!")
     assert response is not None

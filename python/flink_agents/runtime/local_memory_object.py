@@ -17,7 +17,11 @@
 #################################################################################
 from typing import Any, ClassVar, Dict, List
 
-from flink_agents.api.memory_object import MemoryObject, MemoryType
+from flink_agents.api.memory_object import (
+    MemoryObject,
+    MemoryType,
+    validate_memory_value,
+)
 from flink_agents.api.memory_reference import MemoryRef
 
 
@@ -37,7 +41,9 @@ class LocalMemoryObject(MemoryObject):
     __store: dict[str, Any]
     __prefix: str
 
-    def __init__(self, type: MemoryType, store: Dict[str, Any], prefix: str = ROOT_KEY) -> None:
+    def __init__(
+        self, type: MemoryType, store: Dict[str, Any], prefix: str = ROOT_KEY
+    ) -> None:
         """Initialize a LocalMemoryObject.
 
         Parameters
@@ -104,6 +110,7 @@ class LocalMemoryObject(MemoryObject):
         if isinstance(value, LocalMemoryObject):
             msg = "Do not set a MemoryObject instance directly; use new_object()."
             raise TypeError(msg)
+        validate_memory_value(path, value)
 
         abs_path = self._full_path(path)
 

@@ -34,9 +34,7 @@ def parse_java_resource_name(java_path: Path) -> dict:
         r'public\s+static\s+final\s+String\s+([A-Za-z0-9_]+)\s*=\s*"([^"]+)";',
         re.DOTALL,
     )
-    class_re = re.compile(
-        r"public\s+(?:static\s+)?final\s+class\s+(\w+)\s*\{"
-    )
+    class_re = re.compile(r"public\s+(?:static\s+)?final\s+class\s+(\w+)\s*\{")
 
     class_stack = []
     brace_depth = 0
@@ -200,35 +198,42 @@ def _parse_python_resource_name(python_path: Path) -> dict:
             elif len(parts) == 3 and parts[2] == "Java":
                 python_map[(rt, "Java")] = consts
     if "ResourceName" in result and "MCP_SERVER" in result["ResourceName"]:
-        python_map[("MCP", "Python")] = {"MCP_SERVER": result["ResourceName"]["MCP_SERVER"]}
+        python_map[("MCP", "Python")] = {
+            "MCP_SERVER": result["ResourceName"]["MCP_SERVER"]
+        }
     return python_map
 
 
-_JAVA_ONLY_NAMES = frozenset({
-    "PYTHON_WRAPPER_CONNECTION", "PYTHON_WRAPPER_SETUP",
-    "PYTHON_WRAPPER_VECTOR_STORE", "PYTHON_WRAPPER_COLLECTION_MANAGEABLE_VECTOR_STORE",
-})
-_PYTHON_ONLY_NAMES = frozenset({
-    "JAVA_WRAPPER_CONNECTION", "JAVA_WRAPPER_SETUP",
-    "JAVA_WRAPPER_VECTOR_STORE", "JAVA_WRAPPER_COLLECTION_MANAGEABLE_VECTOR_STORE",
-})
+_JAVA_ONLY_NAMES = frozenset(
+    {
+        "PYTHON_WRAPPER_CONNECTION",
+        "PYTHON_WRAPPER_SETUP",
+        "PYTHON_WRAPPER_VECTOR_STORE",
+        "PYTHON_WRAPPER_COLLECTION_MANAGEABLE_VECTOR_STORE",
+    }
+)
+_PYTHON_ONLY_NAMES = frozenset(
+    {
+        "JAVA_WRAPPER_CONNECTION",
+        "JAVA_WRAPPER_SETUP",
+        "JAVA_WRAPPER_VECTOR_STORE",
+        "JAVA_WRAPPER_COLLECTION_MANAGEABLE_VECTOR_STORE",
+    }
+)
 
 
 def _find_python_name_for_value(impls: dict, value: str, java_name: str) -> str | None:
     return java_name if impls.get(java_name) == value else None
 
 
-def check_consistency(
-    java_map: dict, python_map: dict
-) -> tuple[list[str], list[str]]:
-
+def check_consistency(java_map: dict, python_map: dict) -> tuple[list[str], list[str]]:
     errors = []
     warnings = []
 
     all_resource_types = set()
-    for (rt, _) in java_map:
+    for rt, _ in java_map:
         all_resource_types.add(rt)
-    for (rt, _) in python_map:
+    for rt, _ in python_map:
         all_resource_types.add(rt)
 
     for resource_type in sorted(all_resource_types):
@@ -287,7 +292,10 @@ def check_consistency(
 
 def main() -> int:
     root = Path(__file__).resolve().parent.parent.parent
-    java_path = root / "api/src/main/java/org/apache/flink/agents/api/resource/ResourceName.java"
+    java_path = (
+        root
+        / "api/src/main/java/org/apache/flink/agents/api/resource/ResourceName.java"
+    )
     python_path = root / "python/flink_agents/api/resource.py"
 
     if not java_path.exists():
@@ -303,8 +311,19 @@ def main() -> int:
     debug = __import__("os").environ.get("RESOURCE_DEBUG")
     if debug:
         import json
-        print("Java map:", json.dumps({str(k): v for k, v in java_map.items()}, indent=2, ensure_ascii=False))
-        print("Python map:", json.dumps({str(k): v for k, v in python_map.items()}, indent=2, ensure_ascii=False))
+
+        print(
+            "Java map:",
+            json.dumps(
+                {str(k): v for k, v in java_map.items()}, indent=2, ensure_ascii=False
+            ),
+        )
+        print(
+            "Python map:",
+            json.dumps(
+                {str(k): v for k, v in python_map.items()}, indent=2, ensure_ascii=False
+            ),
+        )
 
     errors, warnings = check_consistency(java_map, python_map)
 

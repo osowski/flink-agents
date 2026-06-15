@@ -19,15 +19,14 @@
 package org.apache.flink.agents.api.chat.model;
 
 import org.apache.flink.agents.api.chat.messages.ChatMessage;
-import org.apache.flink.agents.api.metrics.FlinkAgentsMetricGroup;
 import org.apache.flink.agents.api.resource.Resource;
+import org.apache.flink.agents.api.resource.ResourceContext;
 import org.apache.flink.agents.api.resource.ResourceDescriptor;
 import org.apache.flink.agents.api.resource.ResourceType;
 import org.apache.flink.agents.api.tools.Tool;
 
 import java.util.List;
 import java.util.Map;
-import java.util.function.BiFunction;
 
 /**
  * Abstraction of chat model connection.
@@ -37,9 +36,8 @@ import java.util.function.BiFunction;
  */
 public abstract class BaseChatModelConnection extends Resource {
 
-    public BaseChatModelConnection(
-            ResourceDescriptor descriptor, BiFunction<String, ResourceType, Resource> getResource) {
-        super(descriptor, getResource);
+    public BaseChatModelConnection(ResourceDescriptor descriptor, ResourceContext resourceContext) {
+        super(descriptor, resourceContext);
     }
 
     @Override
@@ -52,27 +50,9 @@ public abstract class BaseChatModelConnection extends Resource {
      *
      * @param messages the input chat messages
      * @param tools the tools can be called by the model
-     * @param arguments the additional arguments passed to the model
+     * @param modelParams the additional arguments passed to the model
      * @return the chat response containing model outputs
      */
     public abstract ChatMessage chat(
-            List<ChatMessage> messages, List<Tool> tools, Map<String, Object> arguments);
-
-    /**
-     * Record token usage metrics for the given model.
-     *
-     * @param modelName the name of the model used
-     * @param promptTokens the number of prompt tokens
-     * @param completionTokens the number of completion tokens
-     */
-    protected void recordTokenMetrics(String modelName, long promptTokens, long completionTokens) {
-        FlinkAgentsMetricGroup metricGroup = getMetricGroup();
-        if (metricGroup == null) {
-            return;
-        }
-
-        FlinkAgentsMetricGroup modelGroup = metricGroup.getSubGroup(modelName);
-        modelGroup.getCounter("promptTokens").inc(promptTokens);
-        modelGroup.getCounter("completionTokens").inc(completionTokens);
-    }
+            List<ChatMessage> messages, List<Tool> tools, Map<String, Object> modelParams);
 }

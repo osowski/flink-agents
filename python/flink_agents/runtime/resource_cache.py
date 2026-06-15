@@ -19,7 +19,10 @@ from typing import Any, Dict
 
 from flink_agents.api.resource import Resource, ResourceType
 from flink_agents.plan.configuration import AgentConfiguration
+from flink_agents.plan.function import JavaFunction
 from flink_agents.plan.resource_provider import JavaResourceProvider, ResourceProvider
+from flink_agents.plan.tools.function_tool import FunctionTool
+from flink_agents.runtime.resource_context import ResourceContextImpl
 
 
 class ResourceCache:
@@ -51,6 +54,11 @@ class ResourceCache:
         self._config = config
         self._cache: Dict[ResourceType, Dict[str, Resource]] = {}
         self._j_resource_adapter: Any = None
+        self._resource_context = ResourceContextImpl(self)
+
+    def get_resource_context(self) -> ResourceContextImpl:
+        """Return the long-lived ResourceContext owned by this cache."""
+        return self._resource_context
 
     def set_java_resource_adapter(self, j_resource_adapter: Any) -> None:
         """Set Java resource adapter for Java resource providers."""
@@ -77,15 +85,24 @@ class ResourceCache:
         if isinstance(resource_provider, JavaResourceProvider):
             resource_provider.set_java_resource_adapter(self._j_resource_adapter)
         resource = resource_provider.provide(
-            get_resource=self.get_resource, config=self._config
+            resource_context=self._resource_context, config=self._config
         )
+        if isinstance(resource, FunctionTool) and isinstance(resource.func, JavaFunction):
+            resource.set_java_resource_adapter(self._j_resource_adapter)
         resource.open()
         self._cache.setdefault(type, {})[name] = resource
         return resource
 
     def close(self) -> None:
-        """Clean up all cached resources."""
+        """Clean up all cached resources and close the injected ResourceContext.
+
+        Cascades to ``ResourceContextImpl.close()`` which in turn closes the
+        cached ``SkillManager`` (releasing materialized skill temp dirs). This
+        is what releases skill resources on operator close, including Flink
+        failover when the JVM stays up.
+        """
         for typed in self._cache.values():
             for resource in typed.values():
                 resource.close()
         self._cache.clear()
+        self._resource_context.close()

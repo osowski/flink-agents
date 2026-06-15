@@ -22,6 +22,7 @@ from pyflink.datastream import DataStream, KeySelector, StreamExecutionEnvironme
 from pyflink.table import Schema, StreamTableEnvironment, Table
 
 from flink_agents.api.agents.agent import Agent
+from flink_agents.api.events.tool_event import ToolRequestEvent
 from flink_agents.api.execution_environment import (
     AgentBuilder,
     AgentsExecutionEnvironment,
@@ -52,7 +53,7 @@ class LocalAgentBuilder(AgentBuilder):
         self.__output = []
         self.__config = config
 
-    def apply(self, agent: Agent) -> AgentBuilder:
+    def apply(self, agent: Agent | str) -> AgentBuilder:
         """Create local runner to execute given agent.
 
         Doesn't support apply multiple Agents.
@@ -60,6 +61,14 @@ class LocalAgentBuilder(AgentBuilder):
         if self.__runner is not None:
             err_msg = "LocalAgentBuilder doesn't support apply multiple agents."
             raise RuntimeError(err_msg)
+        if isinstance(agent, str):
+            if agent not in self.__env._agents:
+                msg = (
+                    f"No agent named {agent!r} is registered on this "
+                    "environment. Did you call load_yaml first?"
+                )
+                raise ValueError(msg)
+            agent = self.__env._agents[agent]
         # inspect resources from environment to agent instance.
         registered_resources = self.__env.resources
         for type, name_to_resource in registered_resources.items():
@@ -132,6 +141,10 @@ class LocalExecutionEnvironment(AgentsExecutionEnvironment):
         outputs = self.__runner.get_outputs()
         for output in outputs:
             self.__output.append(output)
+
+    def get_tool_request_events(self) -> List[ToolRequestEvent]:
+        """Get the ToolRequestEvents captured by the runner during execution."""
+        return self.__runner.get_tool_request_events()
 
     def from_datastream(
         self, input: DataStream, key_selector: KeySelector | Callable | None = None

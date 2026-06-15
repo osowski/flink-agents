@@ -15,9 +15,9 @@
 #  See the License for the specific language governing permissions and
 # limitations under the License.
 #################################################################################
-import copy
 import json
 import logging
+import re
 import time
 from typing import TYPE_CHECKING, Dict, List, cast
 from uuid import UUID
@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 _TOOL_CALL_CONTEXT = "_TOOL_CALL_CONTEXT"
 _TOOL_REQUEST_EVENT_CONTEXT = "_TOOL_REQUEST_EVENT_CONTEXT"
 _RETRY_STATS_CONTEXT = "_RETRY_STATS_CONTEXT"
+_PROMPT_ARGS = "prompt_args"
 
 _logger = logging.getLogger(__name__)
 
@@ -57,6 +58,16 @@ _logger = logging.getLogger(__name__)
 # ============================================================================
 # Helper Functions for Tool Call Context Management
 # ============================================================================
+def _serialize_messages(messages: List[ChatMessage]) -> List[Dict]:
+    """Materialize chat messages into JSON-safe dicts for checkpoint-stable memory."""
+    return [message.model_dump(mode="json") for message in messages]
+
+
+def _deserialize_messages(messages: List[Dict]) -> List[ChatMessage]:
+    """Reconstruct chat messages from their stored JSON-safe dict form."""
+    return [ChatMessage.model_validate(message) for message in messages]
+
+
 def _update_tool_call_context(
     sensory_memory: MemoryObject,
     initial_request_id: UUID,
@@ -76,16 +87,15 @@ def _update_tool_call_context(
     #  After memory supports remove, we can use "TOOL_CALL_CONTEXT/request_id"
     #  to store and remove the specific tool context directly.
 
-    # init if not exists
+    key = str(initial_request_id)
     tool_call_context = sensory_memory.get(_TOOL_CALL_CONTEXT) or {}
-    if initial_request_id not in tool_call_context and initial_messages is not None:
-        tool_call_context[initial_request_id] = copy.deepcopy(initial_messages)
+    if key not in tool_call_context and initial_messages is not None:
+        tool_call_context[key] = _serialize_messages(initial_messages)
 
-    tool_call_context[initial_request_id].extend(added_messages)
+    tool_call_context[key].extend(_serialize_messages(added_messages))
 
-    # update tool call context
     sensory_memory.set(_TOOL_CALL_CONTEXT, tool_call_context)
-    return tool_call_context[initial_request_id]
+    return _deserialize_messages(tool_call_context[key])
 
 
 def _save_tool_request_event_context(
@@ -93,14 +103,18 @@ def _save_tool_request_event_context(
     tool_request_event_id: UUID,
     initial_request_id: UUID,
     model: str,
+    prompt_args: Dict | None,
     output_schema: OutputSchema | None,
 ) -> None:
     """Save the context for a specific tool request event."""
     context = sensory_memory.get(_TOOL_REQUEST_EVENT_CONTEXT) or {}
-    context[tool_request_event_id] = {
-        "initial_request_id": initial_request_id,
+    context[str(tool_request_event_id)] = {
+        "initial_request_id": str(initial_request_id),
         "model": model,
-        "output_schema": output_schema,
+        _PROMPT_ARGS: prompt_args if prompt_args is not None else {},
+        "output_schema": output_schema.model_dump()
+        if output_schema is not None
+        else None,
     }
     sensory_memory.set(_TOOL_REQUEST_EVENT_CONTEXT, context)
 
@@ -110,7 +124,17 @@ def _get_tool_request_event_context(
 ) -> Dict:
     """Get and remove the context for a specific tool request event."""
     context = sensory_memory.get(_TOOL_REQUEST_EVENT_CONTEXT) or {}
-    removed_context = context.pop(request_id, {})
+    removed_context = context.pop(str(request_id), {})
+    if removed_context:
+        removed_context["initial_request_id"] = UUID(
+            removed_context["initial_request_id"]
+        )
+        output_schema = removed_context["output_schema"]
+        removed_context["output_schema"] = (
+            OutputSchema.model_validate(output_schema)
+            if output_schema is not None
+            else None
+        )
     return removed_context
 
 
@@ -121,14 +145,18 @@ def _accumulate_retry_stats(
     retry_wait_sec: int,
 ) -> None:
     """Accumulate retry stats for a given initial request across tool call rounds."""
+    key = str(initial_request_id)
     retry_stats_context = sensory_memory.get(_RETRY_STATS_CONTEXT) or {}
-    stats = retry_stats_context.get(initial_request_id, {
-        "total_retry_count": 0,
-        "total_retry_wait_sec": 0,
-    })
+    stats = retry_stats_context.get(
+        key,
+        {
+            "total_retry_count": 0,
+            "total_retry_wait_sec": 0,
+        },
+    )
     stats["total_retry_count"] += retry_count
     stats["total_retry_wait_sec"] += retry_wait_sec
-    retry_stats_context[initial_request_id] = stats
+    retry_stats_context[key] = stats
     sensory_memory.set(_RETRY_STATS_CONTEXT, retry_stats_context)
 
 
@@ -138,10 +166,13 @@ def _get_retry_stats(
 ) -> dict:
     """Get accumulated retry stats for a given initial request."""
     retry_stats_context = sensory_memory.get(_RETRY_STATS_CONTEXT) or {}
-    return retry_stats_context.get(initial_request_id, {
-        "total_retry_count": 0,
-        "total_retry_wait_sec": 0,
-    })
+    return retry_stats_context.get(
+        str(initial_request_id),
+        {
+            "total_retry_count": 0,
+            "total_retry_wait_sec": 0,
+        },
+    )
 
 
 def _record_retry_metrics(
@@ -152,16 +183,41 @@ def _record_retry_metrics(
         return
     metric_group = ctx.action_metric_group
     if metric_group is not None:
-        model_group = metric_group.get_sub_group(model)
+        model_group = metric_group.get_sub_group("model", model)
         model_group.get_counter("retryCount").inc(retry_count)
         model_group.get_counter("retryWaitSec").inc(total_retry_wait_sec)
+
+
+def _inject_bash_tool_args(
+    tool_calls: List[Dict],
+    chat_model: "BaseChatModelSetup",
+) -> None:
+    """Inject framework-controlled args (allowed_commands, allowed_script_dirs)
+    into bash tool calls so they remain hidden from the LLM.
+    """
+    from flink_agents.api.skills import BASH_TOOL
+
+    script_dirs = list(chat_model.allowed_script_dirs)
+    if chat_model.resource_context is not None and chat_model.skills:
+        script_dirs.extend(
+            chat_model.resource_context.get_skill_dirs(*chat_model.skills)
+        )
+
+    for tool_call in tool_calls:
+        if tool_call["function"]["name"] != BASH_TOOL:
+            continue
+        args = tool_call["function"]["arguments"]
+        args["allowed_commands"] = list(chat_model.allowed_commands)
+        args["allowed_script_dirs"] = script_dirs
 
 
 def _handle_tool_calls(
     response: ChatMessage,
     initial_request_id: UUID,
     model: str,
+    chat_model: "BaseChatModelSetup",
     messages: List[ChatMessage],
+    prompt_args: Dict | None,
     output_schema: OutputSchema | None,
     ctx: RunnerContext,
 ) -> None:
@@ -169,6 +225,8 @@ def _handle_tool_calls(
     _update_tool_call_context(
         ctx.sensory_memory, initial_request_id, messages, [response]
     )
+
+    _inject_bash_tool_args(response.tool_calls, chat_model)
 
     tool_request_event = ToolRequestEvent(
         model=model,
@@ -181,6 +239,7 @@ def _handle_tool_calls(
         tool_request_event.id,
         initial_request_id,
         model,
+        prompt_args,
         output_schema,
     )
 
@@ -192,7 +251,7 @@ def _generate_structured_output(
 ) -> ChatMessage:
     """Deserialize output to expected output schema."""
     output_schema = output_schema.output_schema
-    output = json.loads(response.content.strip())
+    output = json.loads(_clean_llm_response(response.content))
 
     if isinstance(output_schema, type) and issubclass(output_schema, BaseModel):
         output = output_schema.model_validate(output)
@@ -207,10 +266,18 @@ def _generate_structured_output(
     return response
 
 
+def _clean_llm_response(raw_response: str) -> str:
+    trimmed = raw_response.strip()
+    if trimmed.startswith("```"):
+        return re.sub(r"(?s)^```(?:json)?\s*(.*?)\s*```$", r"\1", trimmed)
+    return trimmed
+
+
 async def chat(
     initial_request_id: UUID,
     model: str,
     messages: List[ChatMessage],
+    prompt_args: Dict | None,
     output_schema: OutputSchema | None,
     ctx: RunnerContext,
 ) -> None:
@@ -250,9 +317,13 @@ async def chat(
     for attempt in range(num_retries + 1):
         try:
             if chat_async:
-                response = await ctx.durable_execute_async(chat_model.chat, messages)
+                response = await ctx.durable_execute_async(
+                    chat_model.chat, messages, prompt_args=prompt_args
+                )
             else:
-                response = ctx.durable_execute(chat_model.chat, messages)
+                response = ctx.durable_execute(
+                    chat_model.chat, messages, prompt_args=prompt_args
+                )
 
             if (
                 response.extra_args.get("model_name")
@@ -296,21 +367,33 @@ async def chat(
 
     if actual_retry_count > 0:
         _accumulate_retry_stats(
-            ctx.sensory_memory, initial_request_id, actual_retry_count, total_wait_time_sec
+            ctx.sensory_memory,
+            initial_request_id,
+            actual_retry_count,
+            total_wait_time_sec,
         )
 
     if (
         len(response.tool_calls) > 0
     ):  # generate tool request event according tool calls in response
         _handle_tool_calls(
-            response, initial_request_id, model, messages, output_schema, ctx
+            response,
+            initial_request_id,
+            model,
+            chat_model,
+            messages,
+            prompt_args,
+            output_schema,
+            ctx,
         )
     else:  # if there is no tool call generated, return chat response directly
         retry_stats = _get_retry_stats(ctx.sensory_memory, initial_request_id)
         total_retry_count = retry_stats["total_retry_count"]
         total_retry_wait_sec = retry_stats["total_retry_wait_sec"]
 
-        _record_retry_metrics(ctx, chat_model.connection, total_retry_count, total_retry_wait_sec)
+        _record_retry_metrics(
+            ctx, chat_model.connection, total_retry_count, total_retry_wait_sec
+        )
 
         ctx.send_event(
             ChatResponseEvent(
@@ -328,6 +411,7 @@ async def _process_chat_request(event: ChatRequestEvent, ctx: RunnerContext) -> 
         initial_request_id=event.id,
         model=event.model,
         messages=event.messages,
+        prompt_args=event.prompt_args,
         output_schema=event.output_schema,
         ctx=ctx,
     )
@@ -365,6 +449,7 @@ async def _process_tool_response(event: ToolResponseEvent, ctx: RunnerContext) -
         initial_request_id=initial_request_id,
         model=tool_request_event_context["model"],
         messages=messages,
+        prompt_args=tool_request_event_context.get(_PROMPT_ARGS, {}),
         output_schema=tool_request_event_context["output_schema"],
         ctx=ctx,
     )
@@ -381,17 +466,17 @@ async def process_chat_request_or_tool_response(
     """
     # To avoid https://github.com/alibaba/pemja/issues/88, we log a message here.
     logging.debug("Processing chat request asynchronously.")
-    if isinstance(event, ChatRequestEvent):
-        await _process_chat_request(event, ctx)
-    elif isinstance(event, ToolResponseEvent):
-        await _process_tool_response(event, ctx)
+    if event.type == ChatRequestEvent.EVENT_TYPE:
+        await _process_chat_request(ChatRequestEvent.from_event(event), ctx)
+    elif event.type == ToolResponseEvent.EVENT_TYPE:
+        await _process_tool_response(ToolResponseEvent.from_event(event), ctx)
 
 
 CHAT_MODEL_ACTION = Action(
     name="chat_model_action",
     exec=PythonFunction.from_callable(process_chat_request_or_tool_response),
     listen_event_types=[
-        f"{ChatRequestEvent.__module__}.{ChatRequestEvent.__name__}",
-        f"{ToolResponseEvent.__module__}.{ToolResponseEvent.__name__}",
+        ChatRequestEvent.EVENT_TYPE,
+        ToolResponseEvent.EVENT_TYPE,
     ],
 )

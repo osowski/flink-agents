@@ -19,9 +19,8 @@ package org.apache.flink.agents.api.chat.model.python;
 
 import org.apache.flink.agents.api.chat.messages.ChatMessage;
 import org.apache.flink.agents.api.chat.model.BaseChatModelSetup;
-import org.apache.flink.agents.api.resource.Resource;
+import org.apache.flink.agents.api.resource.ResourceContext;
 import org.apache.flink.agents.api.resource.ResourceDescriptor;
-import org.apache.flink.agents.api.resource.ResourceType;
 import org.apache.flink.agents.api.resource.python.PythonResourceAdapter;
 import org.apache.flink.agents.api.resource.python.PythonResourceWrapper;
 import pemja.core.object.PyObject;
@@ -31,7 +30,6 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.function.BiFunction;
 
 import static org.apache.flink.util.Preconditions.checkState;
 
@@ -52,8 +50,8 @@ public class PythonChatModelSetup extends BaseChatModelSetup implements PythonRe
             PythonResourceAdapter adapter,
             PyObject chatModelSetup,
             ResourceDescriptor descriptor,
-            BiFunction<String, ResourceType, Resource> getResource) {
-        super(descriptor, getResource);
+            ResourceContext resourceContext) {
+        super(descriptor, resourceContext);
         this.chatModelSetup = chatModelSetup;
         this.adapter = adapter;
     }
@@ -64,12 +62,15 @@ public class PythonChatModelSetup extends BaseChatModelSetup implements PythonRe
     }
 
     @Override
-    public ChatMessage chat(List<ChatMessage> messages, Map<String, Object> parameters) {
+    public ChatMessage chat(
+            List<ChatMessage> messages,
+            Map<String, Object> promptArgs,
+            Map<String, Object> modelParams) {
         checkState(
                 chatModelSetup != null,
                 "ChatModelSetup is not initialized. Cannot perform chat operation.");
 
-        Map<String, Object> kwargs = new HashMap<>(parameters);
+        Map<String, Object> kwargs = new HashMap<>(modelParams);
 
         List<Object> pythonMessages = new ArrayList<>();
         for (ChatMessage message : messages) {
@@ -77,6 +78,7 @@ public class PythonChatModelSetup extends BaseChatModelSetup implements PythonRe
         }
 
         kwargs.put("messages", pythonMessages);
+        kwargs.put("prompt_args", promptArgs != null ? promptArgs : Collections.emptyMap());
 
         Object pythonMessageResponse = adapter.callMethod(chatModelSetup, "chat", kwargs);
         return adapter.fromPythonChatMessage(pythonMessageResponse);

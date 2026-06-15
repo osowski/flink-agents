@@ -20,6 +20,7 @@ package org.apache.flink.agents.integrations.vectorstores.opensearch;
 
 import org.apache.flink.agents.api.embedding.model.BaseEmbeddingModelSetup;
 import org.apache.flink.agents.api.resource.Resource;
+import org.apache.flink.agents.api.resource.ResourceContext;
 import org.apache.flink.agents.api.resource.ResourceDescriptor;
 import org.apache.flink.agents.api.resource.ResourceType;
 import org.apache.flink.agents.api.vectorstores.BaseVectorStore;
@@ -37,7 +38,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.function.BiFunction;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -49,7 +49,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 public class OpenSearchVectorStoreTest {
 
-    private static final BiFunction<String, ResourceType, Resource> NOOP = (a, b) -> null;
+    private static final ResourceContext NOOP = ResourceContext.fromGetResource((a, b) -> null);
 
     @Test
     @DisplayName("Constructor creates store with IAM auth")
@@ -164,21 +164,24 @@ public class OpenSearchVectorStoreTest {
             builder.addInitialArgument("username", System.getenv("OPENSEARCH_USERNAME"));
             builder.addInitialArgument("password", System.getenv("OPENSEARCH_PASSWORD"));
         }
-        store = new OpenSearchVectorStore(builder.build(), OpenSearchVectorStoreTest::getResource);
+        store =
+                new OpenSearchVectorStore(
+                        builder.build(),
+                        ResourceContext.fromGetResource(OpenSearchVectorStoreTest::getResource));
     }
 
     @Test
     @EnabledIfEnvironmentVariable(named = "OPENSEARCH_ENDPOINT", matches = ".+")
-    @DisplayName("Collection management: create, get, delete")
+    @DisplayName("Collection management: create, delete")
     void testCollectionManagement() throws Exception {
         CollectionManageableVectorStore vs = (CollectionManageableVectorStore) store;
         String name = "test_collection";
-        Map<String, Object> metadata = Map.of("key1", "value1");
-        vs.getOrCreateCollection(name, metadata);
+        // OpenSearch backend ignores any metadata in kwargs (no native index-metadata support).
+        vs.createCollectionIfNotExists(name, Map.of());
 
-        CollectionManageableVectorStore.Collection col = vs.getCollection(name);
-        Assertions.assertNotNull(col);
-        Assertions.assertEquals(name, col.getName());
+        // Collection (index) is created and empty.
+        List<Document> empty = store.get(null, name, null, null, Collections.emptyMap());
+        Assertions.assertTrue(empty.isEmpty());
 
         vs.deleteCollection(name);
     }
@@ -188,7 +191,7 @@ public class OpenSearchVectorStoreTest {
     @DisplayName("Document management: add, get, delete")
     void testDocumentManagement() throws Exception {
         String name = "test_docs";
-        ((CollectionManageableVectorStore) store).getOrCreateCollection(name, Map.of());
+        ((CollectionManageableVectorStore) store).createCollectionIfNotExists(name, Map.of());
 
         List<Document> docs = new ArrayList<>();
         docs.add(new Document("OpenSearch is a search engine", Map.of("src", "test"), "doc1"));
@@ -196,12 +199,12 @@ public class OpenSearchVectorStoreTest {
         store.add(docs, name, Collections.emptyMap());
         Thread.sleep(1000);
 
-        List<Document> all = store.get(null, name, Collections.emptyMap());
+        List<Document> all = store.get(null, name, null, null, Collections.emptyMap());
         Assertions.assertEquals(2, all.size());
 
-        store.delete(Collections.singletonList("doc1"), name, Collections.emptyMap());
+        store.delete(Collections.singletonList("doc1"), name, null, Collections.emptyMap());
         Thread.sleep(1000);
-        List<Document> remaining = store.get(null, name, Collections.emptyMap());
+        List<Document> remaining = store.get(null, name, null, null, Collections.emptyMap());
         Assertions.assertEquals(1, remaining.size());
 
         ((CollectionManageableVectorStore) store).deleteCollection(name);
@@ -212,7 +215,7 @@ public class OpenSearchVectorStoreTest {
     @DisplayName("Query with filter_query restricts results")
     void testQueryWithFilter() throws Exception {
         String name = "test_filter";
-        ((CollectionManageableVectorStore) store).getOrCreateCollection(name, Map.of());
+        ((CollectionManageableVectorStore) store).createCollectionIfNotExists(name, Map.of());
 
         List<Document> docs = new ArrayList<>();
         docs.add(new Document("OpenSearch is a search engine", Map.of("src", "web"), "f1"));
@@ -231,6 +234,116 @@ public class OpenSearchVectorStoreTest {
         Assertions.assertFalse(results.isEmpty());
         Assertions.assertTrue(
                 results.stream().allMatch(d -> "web".equals(d.getMetadata().get("src"))));
+
+        ((CollectionManageableVectorStore) store).deleteCollection(name);
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "OPENSEARCH_ENDPOINT", matches = ".+")
+    @DisplayName("Filters DSL: get and queryEmbedding restrict by metadata")
+    void testFiltersDsl() throws Exception {
+        // Verify the unified equality-only filters DSL gets translated into bool/must term
+        // clauses against metadata.<key>.keyword on both get() and queryEmbedding().
+        String name = "test_filters_dsl";
+        ((CollectionManageableVectorStore) store).createCollectionIfNotExists(name, Map.of());
+
+        store.add(
+                List.of(
+                        new Document(
+                                "OpenSearch is a search engine",
+                                Map.of("user_id", "alice"),
+                                "doc_alice"),
+                        new Document(
+                                "Flink Agents is an AI framework",
+                                Map.of("user_id", "bob"),
+                                "doc_bob")),
+                name,
+                Collections.emptyMap());
+        Thread.sleep(1000);
+
+        List<Document> aliceOnly =
+                store.get(null, name, Map.of("user_id", "alice"), null, Collections.emptyMap());
+        Assertions.assertEquals(1, aliceOnly.size());
+        Assertions.assertEquals("doc_alice", aliceOnly.get(0).getId());
+
+        // queryEmbedding with the same filter should restrict KNN candidates to alice.
+        List<Document> aliceQueried =
+                store.queryEmbedding(
+                        new float[] {0.2f, 0.3f, 0.4f, 0.5f, 0.6f},
+                        5,
+                        name,
+                        Map.of("user_id", "alice"),
+                        Collections.emptyMap());
+        Assertions.assertFalse(aliceQueried.isEmpty());
+        Assertions.assertTrue(aliceQueried.stream().allMatch(d -> "doc_alice".equals(d.getId())));
+
+        ((CollectionManageableVectorStore) store).deleteCollection(name);
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "OPENSEARCH_ENDPOINT", matches = ".+")
+    @DisplayName("update overwrites the existing document in place")
+    void testUpdateOverwritesExistingDocument() throws Exception {
+        // OpenSearch bulk index is upsert by id; update should rewrite the doc in place.
+        String name = "test_update";
+        ((CollectionManageableVectorStore) store).createCollectionIfNotExists(name, Map.of());
+
+        store.add(
+                List.of(
+                        new Document(
+                                "OpenSearch is a search engine",
+                                Map.of("category", "search"),
+                                "doc1")),
+                name,
+                Collections.emptyMap());
+        Thread.sleep(1000);
+
+        store.update(
+                List.of(
+                        new Document(
+                                "Flink Agents is an AI framework",
+                                Map.of("category", "ai"),
+                                "doc1")),
+                name,
+                Collections.emptyMap());
+        Thread.sleep(1000);
+
+        List<Document> after = store.get(List.of("doc1"), name, null, null, Collections.emptyMap());
+        Assertions.assertEquals(1, after.size());
+        Assertions.assertEquals("Flink Agents is an AI framework", after.get(0).getContent());
+        Assertions.assertEquals("ai", after.get(0).getMetadata().get("category"));
+
+        ((CollectionManageableVectorStore) store).deleteCollection(name);
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "OPENSEARCH_ENDPOINT", matches = ".+")
+    @DisplayName("queryEmbedding populates Document.score")
+    void testQueryEmbeddingPopulatesScore() throws Exception {
+        String name = "test_score";
+        ((CollectionManageableVectorStore) store).createCollectionIfNotExists(name, Map.of());
+
+        store.add(
+                List.of(
+                        new Document(
+                                "OpenSearch is a search engine", Map.of("src", "test"), "doc1"),
+                        new Document(
+                                "Flink Agents is an AI framework", Map.of("src", "test"), "doc2")),
+                name,
+                Collections.emptyMap());
+        Thread.sleep(1000);
+
+        List<Document> hits =
+                store.queryEmbedding(
+                        new float[] {0.2f, 0.3f, 0.4f, 0.5f, 0.6f},
+                        5,
+                        name,
+                        null,
+                        Collections.emptyMap());
+        Assertions.assertFalse(hits.isEmpty());
+        Assertions.assertTrue(
+                hits.stream().allMatch(d -> d.getScore() != null),
+                "Every KNN hit should carry an OpenSearch _score");
 
         ((CollectionManageableVectorStore) store).deleteCollection(name);
     }

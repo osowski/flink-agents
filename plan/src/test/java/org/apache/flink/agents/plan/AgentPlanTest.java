@@ -26,12 +26,14 @@ import org.apache.flink.agents.api.annotation.ChatModelSetup;
 import org.apache.flink.agents.api.annotation.Tool;
 import org.apache.flink.agents.api.context.RunnerContext;
 import org.apache.flink.agents.api.resource.Resource;
+import org.apache.flink.agents.api.resource.ResourceContext;
 import org.apache.flink.agents.api.resource.ResourceDescriptor;
 import org.apache.flink.agents.api.resource.ResourceType;
 import org.apache.flink.agents.api.resource.SerializableResource;
 import org.apache.flink.agents.api.resource.python.PythonResourceAdapter;
 import org.apache.flink.agents.api.resource.python.PythonResourceWrapper;
 import org.apache.flink.agents.plan.actions.Action;
+import org.apache.flink.agents.plan.resourceprovider.JavaResourceProvider;
 import org.apache.flink.agents.plan.resourceprovider.JavaSerializableResourceProvider;
 import org.apache.flink.agents.plan.resourceprovider.PythonResourceProvider;
 import org.apache.flink.agents.plan.resourceprovider.ResourceProvider;
@@ -41,18 +43,21 @@ import pemja.core.object.PyObject;
 
 import java.util.List;
 import java.util.Map;
-import java.util.function.BiFunction;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link AgentPlan} constructor that takes an Agent. */
 public class AgentPlanTest {
 
     /** Test event class for testing. */
     public static class TestEvent extends Event {
+        public static final String EVENT_TYPE = "TestEvent";
+
         private final String data;
 
         public TestEvent(String data) {
+            super(EVENT_TYPE);
             this.data = data;
         }
 
@@ -103,8 +108,8 @@ public class AgentPlanTest {
                 PythonResourceAdapter adapter,
                 PyObject chatModel,
                 ResourceDescriptor descriptor,
-                BiFunction<String, ResourceType, Resource> getResource) {
-            super(descriptor, getResource);
+                ResourceContext resourceContext) {
+            super(descriptor, resourceContext);
         }
 
         @Override
@@ -121,13 +126,13 @@ public class AgentPlanTest {
     /** Test agent class with annotated methods. */
     public static class TestAgent extends Agent {
 
-        @org.apache.flink.agents.api.annotation.Action(listenEvents = {InputEvent.class})
-        public void handleInputEvent(InputEvent event, RunnerContext context) {
-            // Test action implementation
+        @org.apache.flink.agents.api.annotation.Action(listenEventTypes = {InputEvent.EVENT_TYPE})
+        public void handleInputEvent(Event event, RunnerContext context) {
+            InputEvent inputEvent = InputEvent.fromEvent(event);
         }
 
         @org.apache.flink.agents.api.annotation.Action(
-                listenEvents = {TestEvent.class, OutputEvent.class})
+                listenEventTypes = {TestEvent.EVENT_TYPE, OutputEvent.EVENT_TYPE})
         public void handleMultipleEvents(Event event, RunnerContext context) {
             // Test action implementation
         }
@@ -156,9 +161,9 @@ public class AgentPlanTest {
 
         @Tool private TestTool anotherTool = new TestTool("anotherTool");
 
-        @org.apache.flink.agents.api.annotation.Action(listenEvents = {InputEvent.class})
-        public void handleInputEvent(InputEvent event, RunnerContext context) {
-            // Test action implementation
+        @org.apache.flink.agents.api.annotation.Action(listenEventTypes = {InputEvent.EVENT_TYPE})
+        public void handleInputEvent(Event event, RunnerContext context) {
+            InputEvent inputEvent = InputEvent.fromEvent(event);
         }
     }
 
@@ -188,44 +193,40 @@ public class AgentPlanTest {
         Action inputAction = agentPlan.getActions().get("handleInputEvent");
         assertThat(inputAction).isNotNull();
         assertThat(inputAction.getName()).isEqualTo("handleInputEvent");
-        assertThat(inputAction.getListenEventTypes())
-                .isEqualTo(List.of(InputEvent.class.getName()));
+        assertThat(inputAction.getListenEventTypes()).isEqualTo(List.of(InputEvent.EVENT_TYPE));
         assertThat(inputAction.getExec()).isInstanceOf(JavaFunction.class);
 
         // Check that the JavaFunction instance has the correct method/class/params
         JavaFunction exec = (JavaFunction) inputAction.getExec();
         assertThat(exec.getQualName()).isEqualTo(TestAgent.class.getName());
         assertThat(exec.getMethodName()).isEqualTo("handleInputEvent");
-        assertThat(exec.getParameterTypes()).containsExactly(InputEvent.class, RunnerContext.class);
+        assertThat(exec.getParameterTypes()).containsExactly(Event.class, RunnerContext.class);
 
         // Verify action details for handleMultipleEvents
         Action multiAction = agentPlan.getActions().get("handleMultipleEvents");
         assertThat(multiAction).isNotNull();
         assertThat(multiAction.getName()).isEqualTo("handleMultipleEvents");
         assertThat(multiAction.getListenEventTypes())
-                .isEqualTo(List.of(TestEvent.class.getName(), OutputEvent.class.getName()));
+                .isEqualTo(List.of(TestEvent.EVENT_TYPE, OutputEvent.EVENT_TYPE));
         assertThat(multiAction.getExec()).isInstanceOf(JavaFunction.class);
 
         // Verify actionsByEvent mapping
         assertThat(agentPlan.getActionsByEvent().size()).isEqualTo(7);
 
         // Check InputEvent mapping
-        List<Action> inputEventActions =
-                agentPlan.getActionsByEvent().get(InputEvent.class.getName());
+        List<Action> inputEventActions = agentPlan.getActionsByEvent().get(InputEvent.EVENT_TYPE);
         assertThat(inputEventActions).isNotNull();
         assertThat(inputEventActions.size()).isEqualTo(1);
         assertThat(inputEventActions.get(0).getName()).isEqualTo("handleInputEvent");
 
         // Check TestEvent mapping
-        List<Action> testEventActions =
-                agentPlan.getActionsByEvent().get(TestEvent.class.getName());
+        List<Action> testEventActions = agentPlan.getActionsByEvent().get(TestEvent.EVENT_TYPE);
         assertThat(testEventActions).isNotNull();
         assertThat(testEventActions.size()).isEqualTo(1);
         assertThat(testEventActions.get(0).getName()).isEqualTo("handleMultipleEvents");
 
         // Check OutputEvent mapping
-        List<Action> outputEventActions =
-                agentPlan.getActionsByEvent().get(OutputEvent.class.getName());
+        List<Action> outputEventActions = agentPlan.getActionsByEvent().get(OutputEvent.EVENT_TYPE);
         assertThat(outputEventActions).isNotNull();
         assertThat(outputEventActions.size()).isEqualTo(1);
         assertThat(outputEventActions.get(0).getName()).isEqualTo("handleMultipleEvents");
@@ -244,6 +245,126 @@ public class AgentPlanTest {
         // Verify that no actions were collected
         assertThat(agentPlan.getActions().size()).isEqualTo(3);
         assertThat(agentPlan.getActionsByEvent().size()).isEqualTo(4);
+    }
+
+    @Test
+    public void testBuiltInActionsAreJavaNativeAfterCompile() throws Exception {
+        AgentPlan agentPlan = new AgentPlan(new Agent() {});
+
+        for (String name :
+                List.of("chat_model_action", "tool_call_action", "context_retrieval_action")) {
+            Action action = agentPlan.getActions().get(name);
+            assertThat(action).isNotNull();
+            assertThat(action.getExec()).isInstanceOf(JavaFunction.class);
+        }
+    }
+
+    /** Cross-language action via {@code @Action(target = @PythonFunction(...))}. */
+    public static class AgentWithCrossLanguageAction extends Agent {
+        @org.apache.flink.agents.api.annotation.Action(
+                listenEventTypes = {InputEvent.EVENT_TYPE},
+                target =
+                        @org.apache.flink.agents.api.annotation.PythonFunction(
+                                module = "my_pkg.handlers",
+                                qualname = "handle_input"))
+        public static void handle(Event event, RunnerContext ctx) {
+            throw new UnsupportedOperationException("cross-language stub");
+        }
+    }
+
+    @Test
+    public void testActionWithPythonTargetCompilesToPythonFunctionExec() throws Exception {
+        AgentPlan plan = new AgentPlan(new AgentWithCrossLanguageAction());
+
+        Action action = plan.getActions().get("handle");
+        assertThat(action).isNotNull();
+        assertThat(action.getExec())
+                .as("non-empty target.module() must compile to a plan PythonFunction exec")
+                .isInstanceOf(org.apache.flink.agents.plan.PythonFunction.class);
+
+        org.apache.flink.agents.plan.PythonFunction exec =
+                (org.apache.flink.agents.plan.PythonFunction) action.getExec();
+        assertThat(exec.getModule()).isEqualTo("my_pkg.handlers");
+        assertThat(exec.getQualName()).isEqualTo("handle_input");
+        assertThat(action.getListenEventTypes()).containsExactly(InputEvent.EVENT_TYPE);
+    }
+
+    /** Plain {@code @Action} (no {@code target}) compiles to a native Java exec. */
+    public static class AgentWithNativeJavaAction extends Agent {
+        @org.apache.flink.agents.api.annotation.Action(listenEventTypes = {InputEvent.EVENT_TYPE})
+        public static void handle(Event event, RunnerContext ctx) {
+            // intentionally empty
+        }
+    }
+
+    @Test
+    public void testActionWithEmptyTargetCompilesToJavaFunctionExec() throws Exception {
+        AgentPlan plan = new AgentPlan(new AgentWithNativeJavaAction());
+
+        Action action = plan.getActions().get("handle");
+        assertThat(action).isNotNull();
+        assertThat(action.getExec())
+                .as("empty target.module() must compile to a plan JavaFunction exec")
+                .isInstanceOf(JavaFunction.class);
+    }
+
+    /** Partially-set target (module without qualname) — must be rejected at compile. */
+    public static class AgentWithHalfSetPythonTargetMissingQualname extends Agent {
+        @org.apache.flink.agents.api.annotation.Action(
+                listenEventTypes = {InputEvent.EVENT_TYPE},
+                target = @org.apache.flink.agents.api.annotation.PythonFunction(module = "pkg"))
+        public static void handle(Event event, RunnerContext ctx) {
+            throw new UnsupportedOperationException("cross-language stub");
+        }
+    }
+
+    @Test
+    public void testActionWithPythonTargetMissingQualnameIsRejected() {
+        assertThatThrownBy(() -> new AgentPlan(new AgentWithHalfSetPythonTargetMissingQualname()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("handle")
+                .hasMessageContaining("qualname");
+    }
+
+    /** Partially-set target (qualname without module) — must be rejected at compile. */
+    public static class AgentWithHalfSetPythonTargetMissingModule extends Agent {
+        @org.apache.flink.agents.api.annotation.Action(
+                listenEventTypes = {InputEvent.EVENT_TYPE},
+                target =
+                        @org.apache.flink.agents.api.annotation.PythonFunction(
+                                qualname = "handle_input"))
+        public static void handle(Event event, RunnerContext ctx) {
+            throw new UnsupportedOperationException("cross-language stub");
+        }
+    }
+
+    @Test
+    public void testActionWithPythonTargetMissingModuleIsRejected() {
+        assertThatThrownBy(() -> new AgentPlan(new AgentWithHalfSetPythonTargetMissingModule()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("handle")
+                .hasMessageContaining("module");
+    }
+
+    /**
+     * @Action declared on a parent agent class — must be rejected loudly, not silently dropped.
+     */
+    public abstract static class BaseAgentWithInheritedAction extends Agent {
+        @org.apache.flink.agents.api.annotation.Action(listenEventTypes = {InputEvent.EVENT_TYPE})
+        public static void sharedAction(Event event, RunnerContext ctx) {
+            throw new UnsupportedOperationException("test stub");
+        }
+    }
+
+    public static class ConcreteAgentInheritingAction extends BaseAgentWithInheritedAction {}
+
+    @Test
+    public void testActionInheritedFromParentAgentClassIsRejected() {
+        assertThatThrownBy(() -> new AgentPlan(new ConcreteAgentInheritingAction()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("sharedAction")
+                .hasMessageContaining("BaseAgentWithInheritedAction")
+                .hasMessageContaining("Inherited @Action");
     }
 
     @Test
@@ -269,11 +390,11 @@ public class AgentPlanTest {
         Agent agent = new Agent();
         Map<String, Object> config = Map.of("key", 123);
         agent.addAction(
-                        new Class[] {InputEvent.class},
+                        new String[] {InputEvent.EVENT_TYPE},
                         TestAgent.class.getMethod(
-                                "handleInputEvent", InputEvent.class, RunnerContext.class))
+                                "handleInputEvent", Event.class, RunnerContext.class))
                 .addAction(
-                        new Class[] {TestEvent.class, OutputEvent.class},
+                        new String[] {TestEvent.EVENT_TYPE, OutputEvent.EVENT_TYPE},
                         TestAgent.class.getMethod(
                                 "handleMultipleEvents", Event.class, RunnerContext.class),
                         config);
@@ -356,5 +477,73 @@ public class AgentPlanTest {
         assertThat(pythonChatModelProvider).isInstanceOf(PythonResourceProvider.class);
         assertThat(pythonChatModelProvider.getName()).isEqualTo("pythonChatModel");
         assertThat(pythonChatModelProvider.getType()).isEqualTo(ResourceType.CHAT_MODEL);
+    }
+
+    @Test
+    public void testAddResourceRegistersEmbeddingModelProvider() throws Exception {
+        Agent agent = new Agent();
+        ResourceDescriptor descriptor =
+                ResourceDescriptor.Builder.newBuilder(TestPythonResource.class.getName())
+                        .addInitialArgument("pythonClazz", "test.module.EmbeddingClazz")
+                        .build();
+        agent.addResource("myEmbedding", ResourceType.EMBEDDING_MODEL, descriptor);
+
+        AgentPlan plan = new AgentPlan(agent);
+
+        Map<String, ResourceProvider> providers =
+                plan.getResourceProviders().get(ResourceType.EMBEDDING_MODEL);
+        assertThat(providers).isNotNull();
+        assertThat(providers).containsKey("myEmbedding");
+
+        ResourceProvider provider = providers.get("myEmbedding");
+        // TestPythonResource implements PythonResourceWrapper, so a Python provider is expected.
+        assertThat(provider).isInstanceOf(PythonResourceProvider.class);
+        assertThat(provider.getName()).isEqualTo("myEmbedding");
+        assertThat(provider.getType()).isEqualTo(ResourceType.EMBEDDING_MODEL);
+    }
+
+    @Test
+    public void testAddResourceRegistersVectorStoreJavaProvider() throws Exception {
+        Agent agent = new Agent();
+        // A non-Python-wrapper class triggers JavaResourceProvider — String is fine for this
+        // structural check; we never call provide() here.
+        ResourceDescriptor descriptor =
+                ResourceDescriptor.Builder.newBuilder(String.class.getName()).build();
+        agent.addResource("myVectorStore", ResourceType.VECTOR_STORE, descriptor);
+
+        AgentPlan plan = new AgentPlan(agent);
+
+        ResourceProvider provider =
+                plan.getResourceProviders().get(ResourceType.VECTOR_STORE).get("myVectorStore");
+        assertThat(provider).isInstanceOf(JavaResourceProvider.class);
+        assertThat(provider.getType()).isEqualTo(ResourceType.VECTOR_STORE);
+    }
+
+    @Test
+    public void testAddResourceRejectsNonDescriptorForUnsupportedType() {
+        Agent agent = new Agent();
+        // SerializableResource for EMBEDDING_MODEL is illegal — only PROMPT / TOOL / SKILLS accept
+        // non-descriptors. The new code path must reject it with a clear message instead of CCE.
+        agent.addResource(
+                "badEmbedding",
+                ResourceType.EMBEDDING_MODEL,
+                new TestSerializableChatModel("badEmbedding"));
+
+        Assertions.assertThrows(IllegalStateException.class, () -> new AgentPlan(agent));
+    }
+
+    @Test
+    public void testAddResourceMCPServerRejectedWithGuidance() {
+        Agent agent = new Agent();
+        ResourceDescriptor descriptor =
+                ResourceDescriptor.Builder.newBuilder("dummy.MCPServer")
+                        .addInitialArgument("endpoint", "http://127.0.0.1:0/mcp")
+                        .build();
+        agent.addResource("addedMcpServer", ResourceType.MCP_SERVER, descriptor);
+
+        UnsupportedOperationException ex =
+                Assertions.assertThrows(
+                        UnsupportedOperationException.class, () -> new AgentPlan(agent));
+        assertThat(ex.getMessage()).contains("@MCPServer");
     }
 }

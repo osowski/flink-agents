@@ -152,6 +152,7 @@ def test_validate_reconciler_callable_accepts_none() -> None:
 
 def test_validate_reconciler_callable_accepts_zero_arg_function() -> None:
     """Accept a zero-argument reconciler function."""
+
     def reconciler() -> str:
         return "ok"
 

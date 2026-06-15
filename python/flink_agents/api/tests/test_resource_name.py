@@ -16,6 +16,7 @@
 # limitations under the License.
 ################################################################################
 """Verify ResourceName Python paths resolve to existing, importable classes."""
+
 from __future__ import annotations
 
 import importlib
@@ -40,9 +41,7 @@ def _collect_python_class_paths() -> list[tuple[str, str]]:
             val = getattr(resource_cls, attr)
             if isinstance(val, str) and val.startswith(PYTHON_PREFIX):
                 paths.append((f"{resource_name}.{attr}", val))
-    if hasattr(ResourceName, "MCP_SERVER") and isinstance(
-        ResourceName.MCP_SERVER, str
-    ):
+    if hasattr(ResourceName, "MCP_SERVER") and isinstance(ResourceName.MCP_SERVER, str):
         if ResourceName.MCP_SERVER.startswith(PYTHON_PREFIX):
             paths.append(("MCP_SERVER", ResourceName.MCP_SERVER))
     return paths
@@ -58,7 +57,10 @@ def _class_exists(full_class_path: str) -> tuple[bool, str]:
         module = importlib.import_module(module_path)
         cls = getattr(module, class_name, None)
         if cls is None:
-            return False, f"module {module_path!r} Attribute does not exist {class_name!r}"
+            return (
+                False,
+                f"module {module_path!r} Attribute does not exist {class_name!r}",
+            )
         if not inspect.isclass(cls):
             return False, f"{full_class_path!r} is not a class"
     except Exception as e:

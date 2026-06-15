@@ -32,7 +32,7 @@ from flink_agents.api.decorators import (
     tool,
 )
 from flink_agents.api.events.chat_event import ChatRequestEvent, ChatResponseEvent
-from flink_agents.api.events.event import InputEvent, OutputEvent
+from flink_agents.api.events.event import Event, InputEvent, OutputEvent
 from flink_agents.api.execution_environment import AgentsExecutionEnvironment
 from flink_agents.api.prompts.prompt import Prompt
 from flink_agents.api.resource import ResourceDescriptor, ResourceType
@@ -81,32 +81,39 @@ class MockChatModel(BaseChatModelSetup):
         """Return model kwargs."""
         return {}
 
-    def chat(self, messages: Sequence[ChatMessage], **kwargs: Any) -> ChatMessage:
+    def chat(
+        self,
+        messages: Sequence[ChatMessage],
+        prompt_args: Dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> ChatMessage:
         """Execute chat conversation."""
         # Get model connection
-        server = self.get_resource(self.connection, ResourceType.CHAT_MODEL_CONNECTION)
+        server = self.resource_context.get_resource(
+            self.connection, ResourceType.CHAT_MODEL_CONNECTION
+        )
 
         # Apply prompt template
         if self.prompt is not None:
             if isinstance(self.prompt, str):
                 # Get prompt resource if it's a string
-                prompt = self.get_resource(self.prompt, ResourceType.PROMPT)
+                prompt = self.resource_context.get_resource(
+                    self.prompt, ResourceType.PROMPT
+                )
             else:
                 prompt = self.prompt
 
             if "sum" in messages[-1].content:
-                input_variable = {}
-                for msg in messages:
-                    # Convert Any values to str to match format_messages signature
-                    str_extra_args = {k: str(v) for k, v in msg.extra_args.items()}
-                    input_variable.update(str_extra_args)
-                messages = prompt.format_messages(**input_variable)
+                str_prompt_args = (
+                    {k: str(v) for k, v in prompt_args.items()} if prompt_args else {}
+                )
+                messages = prompt.format_messages(**str_prompt_args)
 
         # Bind tools
         tools = None
         if self.tools is not None:
             tools = [
-                self.get_resource(tool_name, ResourceType.TOOL)
+                self.resource_context.get_resource(tool_name, ResourceType.TOOL)
                 for tool_name in self.tools
             ]
 
@@ -129,7 +136,9 @@ class MyAgent(Agent):
     @staticmethod
     def mock_connection() -> ResourceDescriptor:
         """Chat model server can be used by ChatModel."""
-        return ResourceDescriptor(clazz=f"{MockChatModelConnection.__module__}.{MockChatModelConnection.__name__}")
+        return ResourceDescriptor(
+            clazz=f"{MockChatModelConnection.__module__}.{MockChatModelConnection.__name__}"
+        )
 
     @chat_model_setup
     @staticmethod
@@ -138,6 +147,7 @@ class MyAgent(Agent):
         return ResourceDescriptor(
             clazz=f"{MockChatModel.__module__}.{MockChatModel.__name__}",
             connection="mock_connection",
+            model="mock-model",
             prompt="prompt",
             tools=["add"],
         )
@@ -161,34 +171,31 @@ class MyAgent(Agent):
         """
         return a + b
 
-    @action(InputEvent)
+    @action(InputEvent.EVENT_TYPE)
     @staticmethod
-    def process_input(event: InputEvent, ctx: RunnerContext) -> None:
+    def process_input(event: Event, ctx: RunnerContext) -> None:
         """User defined action for processing input.
 
         In this action, we will send ChatRequestEvent to trigger built-in actions.
         """
-        input = event.input
+        input = InputEvent.from_event(event).input
         ctx.send_event(
             ChatRequestEvent(
                 model="mock_chat_model",
-                messages=[
-                    ChatMessage(
-                        role=MessageRole.USER, content=input, extra_args={"task": input}
-                    )
-                ],
+                messages=[ChatMessage(role=MessageRole.USER, content=input)],
+                prompt_args={"task": input},
             )
         )
 
-    @action(ChatResponseEvent)
+    @action(ChatResponseEvent.EVENT_TYPE)
     @staticmethod
-    def process_chat_response(event: ChatResponseEvent, ctx: RunnerContext) -> None:
+    def process_chat_response(event: Event, ctx: RunnerContext) -> None:
         """User defined action for processing chat model response."""
-        input = event.response
+        input = ChatResponseEvent.from_event(event).response
         ctx.send_event(OutputEvent(output=input.content))
 
 
-def test_built_in_actions() -> None:  # noqa: D103
+def test_built_in_actions() -> None:
     env = AgentsExecutionEnvironment.get_execution_environment()
 
     input_list = []

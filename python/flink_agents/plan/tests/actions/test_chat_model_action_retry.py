@@ -31,8 +31,12 @@ from flink_agents.api.core_options import (
     ErrorHandlingStrategy,
 )
 from flink_agents.api.events.chat_event import ChatResponseEvent
+from flink_agents.api.events.tool_event import ToolResponseEvent
 from flink_agents.api.metric_group import Counter, MetricGroup
-from flink_agents.plan.actions.chat_model_action import chat
+from flink_agents.plan.actions.chat_model_action import (
+    chat,
+    process_chat_request_or_tool_response,
+)
 
 # ============================================================================
 # Mock infrastructure
@@ -62,10 +66,11 @@ class _MockMetricGroup(MetricGroup):
         self._sub_groups: dict[str, _MockMetricGroup] = {}
         self._counters: dict[str, _MockCounter] = {}
 
-    def get_sub_group(self, name: str) -> "_MockMetricGroup":
-        if name not in self._sub_groups:
-            self._sub_groups[name] = _MockMetricGroup()
-        return self._sub_groups[name]
+    def get_sub_group(self, name: str, value: str | None = None) -> "_MockMetricGroup":
+        key = f"{name}={value}" if value is not None else name
+        if key not in self._sub_groups:
+            self._sub_groups[key] = _MockMetricGroup()
+        return self._sub_groups[key]
 
     def get_counter(self, name: str) -> _MockCounter:
         if name not in self._counters:
@@ -116,7 +121,9 @@ def _create_mock_runner_context(
         id(AgentExecutionOptions.CHAT_ASYNC): False,
     }
     config.get = MagicMock(
-        side_effect=lambda option: option_values.get(id(option), option.get_default_value())
+        side_effect=lambda option: option_values.get(
+            id(option), option.get_default_value()
+        )
     )
 
     ctx = MagicMock()
@@ -125,7 +132,9 @@ def _create_mock_runner_context(
     ctx.action_metric_group = metric_group
     ctx.send_event = MagicMock(side_effect=lambda e: sent_events.append(e))
     ctx.get_resource = MagicMock(return_value=chat_model)
-    ctx.durable_execute = MagicMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs))
+    ctx.durable_execute = MagicMock(
+        side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)
+    )
 
     return ctx, sent_events, metric_group, sensory_memory
 
@@ -149,7 +158,14 @@ class TestChatModelActionRetry:
         request_id = uuid4()
 
         asyncio.run(
-            chat(request_id, chat_model.connection, [ChatMessage(role=MessageRole.USER, content="hi")], None, ctx)
+            chat(
+                request_id,
+                chat_model.connection,
+                [ChatMessage(role=MessageRole.USER, content="hi")],
+                {},
+                None,
+                ctx,
+            )
         )
 
         assert len(sent_events) == 1
@@ -183,7 +199,14 @@ class TestChatModelActionRetry:
 
         start = time.monotonic()
         asyncio.run(
-            chat(request_id, "test-model", [ChatMessage(role=MessageRole.USER, content="hi")], None, ctx)
+            chat(
+                request_id,
+                "test-model",
+                [ChatMessage(role=MessageRole.USER, content="hi")],
+                {},
+                None,
+                ctx,
+            )
         )
         elapsed = time.monotonic() - start
 
@@ -196,7 +219,7 @@ class TestChatModelActionRetry:
         assert elapsed >= 1.0
 
         # Verify metrics recorded under connection name
-        model_group = metric_group.get_sub_group(chat_model.connection)
+        model_group = metric_group.get_sub_group("model", chat_model.connection)
         assert model_group.get_counter("retryCount").get_count() == 1
         assert model_group.get_counter("retryWaitSec").get_count() == 1
 
@@ -212,7 +235,14 @@ class TestChatModelActionRetry:
 
         with pytest.raises(RuntimeError, match="persistent error"):
             asyncio.run(
-                chat(request_id, "test-model", [ChatMessage(role=MessageRole.USER, content="hi")], None, ctx)
+                chat(
+                    request_id,
+                    "test-model",
+                    [ChatMessage(role=MessageRole.USER, content="hi")],
+                    {},
+                    None,
+                    ctx,
+                )
             )
 
         assert len(sent_events) == 0
@@ -248,3 +278,69 @@ class TestRetryWaitIntervalConfig:
     def test_default_value(self) -> None:
         """Default value is 1 second."""
         assert AgentExecutionOptions.RETRY_WAIT_INTERVAL.get_default_value() == 1
+
+
+class TestProcessToolResponsePromptArgsForwarding:
+    """Locks the contract that `_process_tool_response` forwards the saved
+    `prompt_args` from the tool-request-event context into the round-2 call
+    to `chat_model.chat(...)`.
+    """
+
+    def test_forwards_saved_prompt_args_to_chat(self) -> None:
+        initial_request_id = uuid4()
+        tool_request_event_id = uuid4()
+        tool_call_id = "call-1"
+        saved_prompt_args = {"k": "v"}
+
+        captured_prompt_args: list[dict] = []
+
+        def mock_chat(messages: Sequence[ChatMessage], **kwargs: Any) -> ChatMessage:
+            captured_prompt_args.append(kwargs.get("prompt_args"))
+            return ChatMessage(role=MessageRole.ASSISTANT, content="done")
+
+        chat_model = MagicMock()
+        chat_model.chat = mock_chat
+
+        ctx, sent_events, _, sensory_memory = _create_mock_runner_context(
+            chat_model, max_retries=0, retry_wait_interval_sec=0
+        )
+
+        # Pre-seed the tool-request-event context with saved prompt args so
+        # _process_tool_response can look them up.
+        sensory_memory.set(
+            "_TOOL_REQUEST_EVENT_CONTEXT",
+            {
+                str(tool_request_event_id): {
+                    "initial_request_id": str(initial_request_id),
+                    "model": "test-model",
+                    "prompt_args": saved_prompt_args,
+                    "output_schema": None,
+                }
+            },
+        )
+
+        # Pre-seed the tool-call context with prior messages so
+        # _update_tool_call_context can extend them with the tool response.
+        sensory_memory.set(
+            "_TOOL_CALL_CONTEXT",
+            {
+                str(initial_request_id): [
+                    ChatMessage(
+                        role=MessageRole.USER, content="hi"
+                    ).model_dump(mode="json")
+                ]
+            },
+        )
+
+        tool_response_event = ToolResponseEvent(
+            request_id=tool_request_event_id,
+            responses={tool_call_id: "42"},
+            external_ids={},
+        )
+
+        asyncio.run(process_chat_request_or_tool_response(tool_response_event, ctx))
+
+        assert len(captured_prompt_args) == 1
+        assert captured_prompt_args[0] == saved_prompt_args
+        assert len(sent_events) == 1
+        assert isinstance(sent_events[0], ChatResponseEvent)

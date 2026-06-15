@@ -23,13 +23,22 @@ from unittest.mock import MagicMock
 import pytest
 
 from flink_agents.api.resource import Resource, ResourceType
+from flink_agents.api.resource_context import ResourceContext
 from flink_agents.integrations.embedding_models.tongyi_embedding_model import (
     TongyiEmbeddingModelConnection,
     TongyiEmbeddingModelSetup,
 )
 
+pytestmark = pytest.mark.integration
+
 test_model = os.environ.get("TONGYI_EMBEDDING_MODEL", "text-embedding-v4")
 api_key_available = "DASHSCOPE_API_KEY" in os.environ
+
+
+def _make_ctx(get_resource) -> ResourceContext:
+    ctx = MagicMock(spec=ResourceContext)
+    ctx.get_resource = get_resource
+    return ctx
 
 
 @pytest.mark.skipif(not api_key_available, reason="DashScope API key is not set")
@@ -45,11 +54,16 @@ def test_tongyi_embedding_model() -> None:
             raise ValueError(msg)
 
     embedding_model = TongyiEmbeddingModelSetup(
-        name="tongyi", model=test_model, connection="tongyi", get_resource=get_resource
+        name="tongyi",
+        model=test_model,
+        connection="tongyi",
+        resource_context=_make_ctx(get_resource),
     )
     embedding_model.open()
 
-    response = embedding_model.embed("The quality of the clothes is excellent, very beautiful, worth the wait, I like it and will buy here again")
+    response = embedding_model.embed(
+        "The quality of the clothes is excellent, very beautiful, worth the wait, I like it and will buy here again"
+    )
     assert response is not None
     assert isinstance(response, list)
     assert len(response) > 0
@@ -73,7 +87,7 @@ def test_tongyi_embedding_with_text_type() -> None:
         model=test_model,
         connection="tongyi",
         text_type="query",
-        get_resource=get_resource,
+        resource_context=_make_ctx(get_resource),
     )
     embedding_model_query.open()
 
@@ -87,7 +101,7 @@ def test_tongyi_embedding_with_text_type() -> None:
         model=test_model,
         connection="tongyi",
         text_type="document",
-        get_resource=get_resource,
+        resource_context=_make_ctx(get_resource),
     )
     embedding_model_doc.open()
 
@@ -127,7 +141,10 @@ def test_tongyi_embedding_mock(monkeypatch: pytest.MonkeyPatch) -> None:
             raise ValueError(msg)
 
     embedding_model = TongyiEmbeddingModelSetup(
-        name="tongyi", model=test_model, connection="tongyi", get_resource=get_resource
+        name="tongyi",
+        model=test_model,
+        connection="tongyi",
+        resource_context=_make_ctx(get_resource),
     )
     embedding_model.open()
 
@@ -173,7 +190,10 @@ def test_tongyi_embedding_batch_mock(monkeypatch: pytest.MonkeyPatch) -> None:
             raise ValueError(msg)
 
     embedding_model = TongyiEmbeddingModelSetup(
-        name="tongyi", model=test_model, connection="tongyi", get_resource=get_resource
+        name="tongyi",
+        model=test_model,
+        connection="tongyi",
+        resource_context=_make_ctx(get_resource),
     )
     embedding_model.open()
 

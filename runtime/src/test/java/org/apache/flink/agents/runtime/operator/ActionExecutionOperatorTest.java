@@ -19,12 +19,16 @@ package org.apache.flink.agents.runtime.operator;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.flink.agents.api.Event;
+import org.apache.flink.agents.api.EventContext;
 import org.apache.flink.agents.api.InputEvent;
 import org.apache.flink.agents.api.OutputEvent;
 import org.apache.flink.agents.api.configuration.AgentConfigOptions;
 import org.apache.flink.agents.api.context.DurableCallable;
 import org.apache.flink.agents.api.context.MemoryObject;
 import org.apache.flink.agents.api.context.RunnerContext;
+import org.apache.flink.agents.api.listener.EventListener;
+import org.apache.flink.agents.api.logger.EventLoggerConfig;
+import org.apache.flink.agents.api.logger.LoggerType;
 import org.apache.flink.agents.plan.AgentConfiguration;
 import org.apache.flink.agents.plan.AgentPlan;
 import org.apache.flink.agents.plan.JavaFunction;
@@ -228,6 +232,41 @@ public class ActionExecutionOperatorTest {
 
             assertThat(ownerHarness.getTaskMailbox().size()).isEqualTo(1);
             assertThat(nonOwnerHarness.getTaskMailbox().size()).isZero();
+            assertThat(
+                            ((ActionExecutionOperator<Long, Object>) ownerHarness.getOperator())
+                                    .getOperatorStateManager()
+                                    .getProcessingKeys())
+                    .containsExactly(key);
+            assertThat(
+                            ((ActionExecutionOperator<Long, Object>) nonOwnerHarness.getOperator())
+                                    .getOperatorStateManager()
+                                    .getProcessingKeys())
+                    .isEmpty();
+
+            OperatorSubtaskState secondCheckpoint =
+                    AbstractStreamOperatorTestHarness.repackageState(
+                            ownerHarness.snapshot(2L, 2L), nonOwnerHarness.snapshot(2L, 2L));
+            OperatorSubtaskState secondRestoreOwnerState =
+                    AbstractStreamOperatorTestHarness.repartitionOperatorState(
+                            secondCheckpoint,
+                            maxParallelism,
+                            newParallelism,
+                            newParallelism,
+                            ownerSubtask);
+
+            try (KeyedOneInputStreamOperatorTestHarness<Long, Long, Object> restoredOwnerHarness =
+                    new KeyedOneInputStreamOperatorTestHarness<>(
+                            new ActionExecutionOperatorFactory(TestAgent.getAgentPlan(false), true),
+                            (KeySelector<Long, Long>) value -> value,
+                            TypeInformation.of(Long.class),
+                            maxParallelism,
+                            newParallelism,
+                            ownerSubtask)) {
+                restoredOwnerHarness.initializeState(secondRestoreOwnerState);
+                restoredOwnerHarness.open();
+
+                assertThat(restoredOwnerHarness.getTaskMailbox().size()).isEqualTo(1);
+            }
         }
     }
 
@@ -264,12 +303,9 @@ public class ActionExecutionOperatorTest {
             ActionExecutionOperator<Long, Object> operator =
                     (ActionExecutionOperator<Long, Object>) testHarness.getOperator();
 
-            // Use reflection to access the action state store for validation
-            Field actionStateStoreField =
-                    ActionExecutionOperator.class.getDeclaredField("actionStateStore");
-            actionStateStoreField.setAccessible(true);
             InMemoryActionStateStore actionStateStore =
-                    (InMemoryActionStateStore) actionStateStoreField.get(operator);
+                    (InMemoryActionStateStore)
+                            operator.getDurableExecutionManager().getActionStateStore();
 
             assertThat(actionStateStore).isNotNull();
             assertThat(actionStateStore.getKeyedActionStates()).isEmpty();
@@ -309,10 +345,116 @@ public class ActionExecutionOperatorTest {
         }
     }
 
+    /** A EventListener for unit test */
+    public static class TestEventListener implements EventListener {
+        public boolean called = false;
+
+        @Override
+        public void onEventProcessed(EventContext context, Event event) {
+            this.called = true;
+        }
+    }
+
+    @Test
+    void testEventListenersFromAgentConfig() throws Exception {
+        final AgentConfiguration config = new AgentConfiguration();
+        config.set(AgentConfigOptions.EVENT_LISTENERS, List.of(TestEventListener.class.getName()));
+        final AgentPlan agentPlan = TestAgent.getAgentPlanWithConfig(config);
+
+        try (KeyedOneInputStreamOperatorTestHarness<Long, Long, Object> testHarness =
+                new KeyedOneInputStreamOperatorTestHarness<>(
+                        new ActionExecutionOperatorFactory(agentPlan, true),
+                        (KeySelector<Long, Long>) value -> value,
+                        TypeInformation.of(Long.class))) {
+            testHarness.open();
+            final ActionExecutionOperator<Long, Object> operator =
+                    (ActionExecutionOperator<Long, Object>) testHarness.getOperator();
+            final Field eventListenersField = EventRouter.class.getDeclaredField("eventListeners");
+            eventListenersField.setAccessible(true);
+            final Object obj = eventListenersField.get(operator.getEventRouter());
+            assertThat(obj).isNotNull();
+            assertThat(obj).isInstanceOf(List.class);
+
+            final List eventListeners = (List) obj;
+            assertThat(eventListeners.size()).isEqualTo(1);
+
+            final Object listener = eventListeners.get(0);
+            assertThat(listener).isInstanceOf(TestEventListener.class);
+
+            // listener should not have been triggered yet
+            boolean called = ((TestEventListener) listener).called;
+            assertThat(called).isFalse();
+
+            // process a some element to trigger the operator logic
+            testHarness.processElement(new StreamRecord<>(1L));
+
+            // listener should have been invoked after element processing
+            called = ((TestEventListener) listener).called;
+            assertThat(called).isTrue();
+        }
+    }
+
+    @Test
+    void testDoesNotPruneBeforeCheckpointComplete() throws Exception {
+        AgentPlan agentPlanWithStateStore = TestAgent.getAgentPlan(false);
+        RecordingActionStateStore actionStateStore = new RecordingActionStateStore();
+
+        try (KeyedOneInputStreamOperatorTestHarness<Long, Long, Object> testHarness =
+                new KeyedOneInputStreamOperatorTestHarness<>(
+                        new ActionExecutionOperatorFactory<>(
+                                agentPlanWithStateStore, true, actionStateStore),
+                        (KeySelector<Long, Long>) value -> value,
+                        TypeInformation.of(Long.class))) {
+            testHarness.open();
+            ActionExecutionOperator<Long, Object> operator =
+                    (ActionExecutionOperator<Long, Object>) testHarness.getOperator();
+
+            testHarness.processElement(new StreamRecord<>(5L));
+            operator.waitInFlightEventsFinished();
+            assertThat(actionStateStore.getPrunedSeqNums()).isEmpty();
+
+            testHarness.snapshot(1L, 1L);
+            assertThat(actionStateStore.getPrunedSeqNums()).isEmpty();
+            testHarness.notifyOfCompletedCheckpoint(1L);
+
+            assertThat(actionStateStore.getPrunedSeqNums()).containsExactly(0L);
+        }
+    }
+
+    @Test
+    void testDoesNotPruneSeqsInFlight() throws Exception {
+        AgentPlan agentPlanWithStateStore = TestAgent.getAgentPlan(false);
+        RecordingActionStateStore actionStateStore = new RecordingActionStateStore();
+
+        try (KeyedOneInputStreamOperatorTestHarness<Long, Long, Object> testHarness =
+                new KeyedOneInputStreamOperatorTestHarness<>(
+                        new ActionExecutionOperatorFactory<>(
+                                agentPlanWithStateStore, true, actionStateStore),
+                        (KeySelector<Long, Long>) value -> value,
+                        TypeInformation.of(Long.class))) {
+            testHarness.open();
+            ActionExecutionOperator<Long, Object> operator =
+                    (ActionExecutionOperator<Long, Object>) testHarness.getOperator();
+
+            testHarness.processElement(new StreamRecord<>(5L));
+            operator.waitInFlightEventsFinished();
+            actionStateStore.clearPruneCalls();
+
+            testHarness.processElement(new StreamRecord<>(5L));
+            assertThat(testHarness.getTaskMailbox().size()).isEqualTo(1);
+
+            testHarness.snapshot(1L, 1L);
+            testHarness.notifyOfCompletedCheckpoint(1L);
+
+            assertThat(actionStateStore.getPrunedSeqNums()).containsExactly(0L);
+        }
+    }
+
     @Test
     void testEventLogBaseDirFromAgentConfig() throws Exception {
         String baseLogDir = "/tmp/flink-agents-test";
         AgentConfiguration config = new AgentConfiguration();
+        config.set(AgentConfigOptions.EVENT_LOGGER_TYPE, LoggerType.FILE);
         config.set(AgentConfigOptions.BASE_LOG_DIR, baseLogDir);
         config.set(AgentConfigOptions.PRETTY_PRINT, true);
         AgentPlan agentPlan = TestAgent.getAgentPlanWithConfig(config);
@@ -325,9 +467,7 @@ public class ActionExecutionOperatorTest {
             testHarness.open();
             ActionExecutionOperator<Long, Object> operator =
                     (ActionExecutionOperator<Long, Object>) testHarness.getOperator();
-            Field eventLoggerField = ActionExecutionOperator.class.getDeclaredField("eventLogger");
-            eventLoggerField.setAccessible(true);
-            Object eventLogger = eventLoggerField.get(operator);
+            Object eventLogger = operator.getEventRouter().getEventLogger();
             assertThat(eventLogger).isInstanceOf(FileEventLogger.class);
 
             Field configField = FileEventLogger.class.getDeclaredField("config");
@@ -338,9 +478,13 @@ public class ActionExecutionOperatorTest {
             @SuppressWarnings("unchecked")
             Map<String, Object> properties =
                     (Map<String, Object>) propertiesField.get(loggerConfig);
-            assertThat(properties.get(FileEventLogger.BASE_LOG_DIR_PROPERTY_KEY))
+            @SuppressWarnings("unchecked")
+            Map<String, Object> agentConfig =
+                    (Map<String, Object>)
+                            properties.get(EventLoggerConfig.AGENT_CONFIG_PROPERTY_KEY);
+            assertThat(agentConfig.get(AgentConfigOptions.BASE_LOG_DIR.getKey()))
                     .isEqualTo(baseLogDir);
-            assertThat(properties.get(FileEventLogger.PRETTY_PRINT_PROPERTY_KEY)).isEqualTo(true);
+            assertThat(agentConfig.get(AgentConfigOptions.PRETTY_PRINT.getKey())).isEqualTo(true);
         }
     }
 
@@ -358,12 +502,9 @@ public class ActionExecutionOperatorTest {
             ActionExecutionOperator<Long, Object> operator =
                     (ActionExecutionOperator<Long, Object>) testHarness.getOperator();
 
-            // Use reflection to access the action state store for validation
-            Field actionStateStoreField =
-                    ActionExecutionOperator.class.getDeclaredField("actionStateStore");
-            actionStateStoreField.setAccessible(true);
             InMemoryActionStateStore actionStateStore =
-                    (InMemoryActionStateStore) actionStateStoreField.get(operator);
+                    (InMemoryActionStateStore)
+                            operator.getDurableExecutionManager().getActionStateStore();
 
             Long inputValue = 3L;
             testHarness.processElement(new StreamRecord<>(inputValue));
@@ -433,12 +574,9 @@ public class ActionExecutionOperatorTest {
             ActionExecutionOperator<Long, Object> operator =
                     (ActionExecutionOperator<Long, Object>) testHarness.getOperator();
 
-            // Access the action state store
-            java.lang.reflect.Field actionStateStoreField =
-                    ActionExecutionOperator.class.getDeclaredField("actionStateStore");
-            actionStateStoreField.setAccessible(true);
             InMemoryActionStateStore actionStateStore =
-                    (InMemoryActionStateStore) actionStateStoreField.get(operator);
+                    (InMemoryActionStateStore)
+                            operator.getDurableExecutionManager().getActionStateStore();
 
             // Process multiple elements with same key to test state persistence
             testHarness.processElement(new StreamRecord<>(1L));
@@ -473,7 +611,7 @@ public class ActionExecutionOperatorTest {
     }
 
     @Test
-    void testActionStateStoreCleanupAfterOutputEvent() throws Exception {
+    void testActionStateStoreCleanupAfterCheckpointComplete() throws Exception {
         AgentPlan agentPlanWithStateStore = TestAgent.getAgentPlan(false);
 
         try (KeyedOneInputStreamOperatorTestHarness<Long, Long, Object> testHarness =
@@ -502,13 +640,66 @@ public class ActionExecutionOperatorTest {
                     (List<StreamRecord<Object>>) testHarness.getRecordOutput();
             assertThat(recordOutput.size()).isEqualTo(3);
 
-            // Access the action state store
-            Field actionStateStoreField =
-                    ActionExecutionOperator.class.getDeclaredField("actionStateStore");
-            actionStateStoreField.setAccessible(true);
             InMemoryActionStateStore actionStateStore =
-                    (InMemoryActionStateStore) actionStateStoreField.get(operator);
+                    (InMemoryActionStateStore)
+                            operator.getDurableExecutionManager().getActionStateStore();
+            assertThat(actionStateStore.getKeyedActionStates()).isNotEmpty();
+
+            testHarness.snapshot(1L, 1L);
+            testHarness.notifyOfCompletedCheckpoint(1L);
+
             assertThat(actionStateStore.getKeyedActionStates()).isEmpty();
+        }
+    }
+
+    @Test
+    void testEarlierCheckpointReplayKeepsDurableState() throws Exception {
+        AgentPlan agentPlan = TestAgent.getDurableSyncAgentPlan();
+        InMemoryActionStateStore actionStateStore = new InMemoryActionStateStore(true);
+        OperatorSubtaskState snapshot;
+
+        TestAgent.DURABLE_CALL_COUNTER.set(0);
+
+        try (KeyedOneInputStreamOperatorTestHarness<Long, Long, Object> testHarness =
+                new KeyedOneInputStreamOperatorTestHarness<>(
+                        new ActionExecutionOperatorFactory<>(agentPlan, true, actionStateStore),
+                        (KeySelector<Long, Long>) value -> value,
+                        TypeInformation.of(Long.class))) {
+            testHarness.open();
+            ActionExecutionOperator<Long, Object> operator =
+                    (ActionExecutionOperator<Long, Object>) testHarness.getOperator();
+
+            // Simulate failure recovery from a checkpoint taken before this input was processed.
+            snapshot = testHarness.snapshot(1L, 1L);
+
+            testHarness.processElement(new StreamRecord<>(7L));
+            operator.waitInFlightEventsFinished();
+
+            assertThat(TestAgent.DURABLE_CALL_COUNTER.get()).isEqualTo(1);
+            assertThat(actionStateStore.getKeyedActionStates()).isNotEmpty();
+        }
+
+        try (KeyedOneInputStreamOperatorTestHarness<Long, Long, Object> testHarness =
+                new KeyedOneInputStreamOperatorTestHarness<>(
+                        new ActionExecutionOperatorFactory<>(agentPlan, true, actionStateStore),
+                        (KeySelector<Long, Long>) value -> value,
+                        TypeInformation.of(Long.class))) {
+            testHarness.initializeState(snapshot);
+            testHarness.open();
+            ActionExecutionOperator<Long, Object> operator =
+                    (ActionExecutionOperator<Long, Object>) testHarness.getOperator();
+
+            // Replay the same input after restoring from the earlier checkpoint.
+            testHarness.processElement(new StreamRecord<>(7L));
+            operator.waitInFlightEventsFinished();
+
+            List<StreamRecord<Object>> recordOutput =
+                    (List<StreamRecord<Object>>) testHarness.getRecordOutput();
+            assertThat(recordOutput).hasSize(1);
+            assertThat(recordOutput.get(0).getValue()).isEqualTo(21L);
+            assertThat(TestAgent.DURABLE_CALL_COUNTER.get())
+                    .as("Durable supplier should not be re-executed during replay")
+                    .isEqualTo(1);
         }
     }
 
@@ -526,11 +717,9 @@ public class ActionExecutionOperatorTest {
             ActionExecutionOperator<Long, Object> operator =
                     (ActionExecutionOperator<Long, Object>) testHarness.getOperator();
 
-            // Access the action state store
-            Field actionStateStoreField =
-                    ActionExecutionOperator.class.getDeclaredField("actionStateStore");
-            actionStateStoreField.setAccessible(true);
-            actionStateStore = (InMemoryActionStateStore) actionStateStoreField.get(operator);
+            actionStateStore =
+                    (InMemoryActionStateStore)
+                            operator.getDurableExecutionManager().getActionStateStore();
 
             Long inputValue = 7L;
 
@@ -1230,10 +1419,12 @@ public class ActionExecutionOperatorTest {
                 new java.util.concurrent.atomic.AtomicInteger(0);
 
         public static class MiddleEvent extends Event {
+            public static final String EVENT_TYPE = "MiddleEvent";
+
             public Long num;
 
             public MiddleEvent(Long num) {
-                super();
+                super(EVENT_TYPE);
                 this.num = num;
             }
 
@@ -1242,8 +1433,8 @@ public class ActionExecutionOperatorTest {
             }
         }
 
-        public static void action1(InputEvent event, RunnerContext context) {
-            Long inputData = (Long) event.getInput();
+        public static void action1(Event event, RunnerContext context) {
+            Long inputData = (Long) InputEvent.fromEvent(event).getInput();
             try {
                 MemoryObject mem = context.getShortTermMemory();
                 mem.set("tmp", inputData + 1);
@@ -1325,8 +1516,8 @@ public class ActionExecutionOperatorTest {
             };
         }
 
-        public static void asyncAction1(InputEvent event, RunnerContext context) {
-            Long inputData = (Long) event.getInput();
+        public static void asyncAction1(Event event, RunnerContext context) {
+            Long inputData = (Long) InputEvent.fromEvent(event).getInput();
             try {
                 Long result =
                         context.durableExecuteAsync(
@@ -1350,8 +1541,8 @@ public class ActionExecutionOperatorTest {
             }
         }
 
-        public static void multiAsyncAction(InputEvent event, RunnerContext context) {
-            Long inputData = (Long) event.getInput();
+        public static void multiAsyncAction(Event event, RunnerContext context) {
+            Long inputData = (Long) InputEvent.fromEvent(event).getInput();
             try {
                 Long result1 =
                         context.durableExecuteAsync(
@@ -1389,8 +1580,8 @@ public class ActionExecutionOperatorTest {
             }
         }
 
-        public static void durableSyncAction(InputEvent event, RunnerContext context) {
-            Long inputData = (Long) event.getInput();
+        public static void durableSyncAction(Event event, RunnerContext context) {
+            Long inputData = (Long) InputEvent.fromEvent(event).getInput();
             try {
                 Long result =
                         context.durableExecute(
@@ -1435,7 +1626,7 @@ public class ActionExecutionOperatorTest {
                 ReconcileBehavior.SUCCESS;
         public static volatile long MIXED_RECONCILE_RESULT = 50L;
 
-        public static void durableExceptionAction(InputEvent event, RunnerContext context) {
+        public static void durableExceptionAction(Event event, RunnerContext context) {
             try {
                 context.durableExecute(
                         durableCallable(
@@ -1451,8 +1642,8 @@ public class ActionExecutionOperatorTest {
             }
         }
 
-        public static void durableReconcilableAction(InputEvent event, RunnerContext context) {
-            Long inputData = (Long) event.getInput();
+        public static void durableReconcilableAction(Event event, RunnerContext context) {
+            Long inputData = (Long) InputEvent.fromEvent(event).getInput();
             try {
                 Long result =
                         context.durableExecute(
@@ -1481,8 +1672,8 @@ public class ActionExecutionOperatorTest {
             }
         }
 
-        public static void durableMixedRecoveryAction(InputEvent event, RunnerContext context) {
-            Long inputData = (Long) event.getInput();
+        public static void durableMixedRecoveryAction(Event event, RunnerContext context) {
+            Long inputData = (Long) InputEvent.fromEvent(event).getInput();
             try {
                 Long firstResult =
                         context.durableExecute(
@@ -1554,8 +1745,8 @@ public class ActionExecutionOperatorTest {
                                 new JavaFunction(
                                         TestAgent.class,
                                         "action1",
-                                        new Class<?>[] {InputEvent.class, RunnerContext.class}),
-                                Collections.singletonList(InputEvent.class.getName()));
+                                        new Class<?>[] {Event.class, RunnerContext.class}),
+                                Collections.singletonList(InputEvent.EVENT_TYPE));
                 Action action2 =
                         new Action(
                                 "action2",
@@ -1563,9 +1754,9 @@ public class ActionExecutionOperatorTest {
                                         TestAgent.class,
                                         "action2",
                                         new Class<?>[] {MiddleEvent.class, RunnerContext.class}),
-                                Collections.singletonList(MiddleEvent.class.getName()));
-                actionsByEvent.put(InputEvent.class.getName(), Collections.singletonList(action1));
-                actionsByEvent.put(MiddleEvent.class.getName(), Collections.singletonList(action2));
+                                Collections.singletonList(MiddleEvent.EVENT_TYPE));
+                actionsByEvent.put(InputEvent.EVENT_TYPE, Collections.singletonList(action1));
+                actionsByEvent.put(MiddleEvent.EVENT_TYPE, Collections.singletonList(action2));
                 Map<String, Action> actions = new HashMap<>();
                 actions.put(action1.getName(), action1);
                 actions.put(action2.getName(), action2);
@@ -1580,9 +1771,8 @@ public class ActionExecutionOperatorTest {
                                             new Class<?>[] {
                                                 MiddleEvent.class, RunnerContext.class
                                             }),
-                                    Collections.singletonList(MiddleEvent.class.getName()));
-                    actionsByEvent.put(
-                            MiddleEvent.class.getName(), Collections.singletonList(action3));
+                                    Collections.singletonList(MiddleEvent.EVENT_TYPE));
+                    actionsByEvent.put(MiddleEvent.EVENT_TYPE, Collections.singletonList(action3));
                     actions.put(action3.getName(), action3);
                 }
 
@@ -1612,11 +1802,10 @@ public class ActionExecutionOperatorTest {
                                     new JavaFunction(
                                             TestAgent.class,
                                             "multiAsyncAction",
-                                            new Class<?>[] {InputEvent.class, RunnerContext.class}),
-                                    Collections.singletonList(InputEvent.class.getName()));
+                                            new Class<?>[] {Event.class, RunnerContext.class}),
+                                    Collections.singletonList(InputEvent.EVENT_TYPE));
                     actionsByEvent.put(
-                            InputEvent.class.getName(),
-                            Collections.singletonList(multiAsyncAction));
+                            InputEvent.EVENT_TYPE, Collections.singletonList(multiAsyncAction));
                     actions.put(multiAsyncAction.getName(), multiAsyncAction);
                 } else {
                     // Use asyncAction1 -> action2 chain
@@ -1626,8 +1815,8 @@ public class ActionExecutionOperatorTest {
                                     new JavaFunction(
                                             TestAgent.class,
                                             "asyncAction1",
-                                            new Class<?>[] {InputEvent.class, RunnerContext.class}),
-                                    Collections.singletonList(InputEvent.class.getName()));
+                                            new Class<?>[] {Event.class, RunnerContext.class}),
+                                    Collections.singletonList(InputEvent.EVENT_TYPE));
                     Action action2 =
                             new Action(
                                     "action2",
@@ -1637,11 +1826,10 @@ public class ActionExecutionOperatorTest {
                                             new Class<?>[] {
                                                 MiddleEvent.class, RunnerContext.class
                                             }),
-                                    Collections.singletonList(MiddleEvent.class.getName()));
+                                    Collections.singletonList(MiddleEvent.EVENT_TYPE));
                     actionsByEvent.put(
-                            InputEvent.class.getName(), Collections.singletonList(asyncAction1));
-                    actionsByEvent.put(
-                            MiddleEvent.class.getName(), Collections.singletonList(action2));
+                            InputEvent.EVENT_TYPE, Collections.singletonList(asyncAction1));
+                    actionsByEvent.put(MiddleEvent.EVENT_TYPE, Collections.singletonList(action2));
                     actions.put(asyncAction1.getName(), asyncAction1);
                     actions.put(action2.getName(), action2);
                 }
@@ -1664,10 +1852,10 @@ public class ActionExecutionOperatorTest {
                                 new JavaFunction(
                                         TestAgent.class,
                                         "durableSyncAction",
-                                        new Class<?>[] {InputEvent.class, RunnerContext.class}),
-                                Collections.singletonList(InputEvent.class.getName()));
+                                        new Class<?>[] {Event.class, RunnerContext.class}),
+                                Collections.singletonList(InputEvent.EVENT_TYPE));
                 actionsByEvent.put(
-                        InputEvent.class.getName(), Collections.singletonList(durableSyncAction));
+                        InputEvent.EVENT_TYPE, Collections.singletonList(durableSyncAction));
                 actions.put(durableSyncAction.getName(), durableSyncAction);
 
                 return new AgentPlan(actions, actionsByEvent, new HashMap<>());
@@ -1688,10 +1876,10 @@ public class ActionExecutionOperatorTest {
                                 new JavaFunction(
                                         TestAgent.class,
                                         "durableReconcilableAction",
-                                        new Class<?>[] {InputEvent.class, RunnerContext.class}),
-                                Collections.singletonList(InputEvent.class.getName()));
+                                        new Class<?>[] {Event.class, RunnerContext.class}),
+                                Collections.singletonList(InputEvent.EVENT_TYPE));
                 actionsByEvent.put(
-                        InputEvent.class.getName(), Collections.singletonList(reconcilableAction));
+                        InputEvent.EVENT_TYPE, Collections.singletonList(reconcilableAction));
                 actions.put(reconcilableAction.getName(), reconcilableAction);
 
                 return new AgentPlan(actions, actionsByEvent, new HashMap<>());
@@ -1712,10 +1900,10 @@ public class ActionExecutionOperatorTest {
                                 new JavaFunction(
                                         TestAgent.class,
                                         "durableMixedRecoveryAction",
-                                        new Class<?>[] {InputEvent.class, RunnerContext.class}),
-                                Collections.singletonList(InputEvent.class.getName()));
+                                        new Class<?>[] {Event.class, RunnerContext.class}),
+                                Collections.singletonList(InputEvent.EVENT_TYPE));
                 actionsByEvent.put(
-                        InputEvent.class.getName(), Collections.singletonList(mixedRecoveryAction));
+                        InputEvent.EVENT_TYPE, Collections.singletonList(mixedRecoveryAction));
                 actions.put(mixedRecoveryAction.getName(), mixedRecoveryAction);
 
                 return new AgentPlan(actions, actionsByEvent, new HashMap<>());
@@ -1736,10 +1924,10 @@ public class ActionExecutionOperatorTest {
                                 new JavaFunction(
                                         TestAgent.class,
                                         "durableExceptionAction",
-                                        new Class<?>[] {InputEvent.class, RunnerContext.class}),
-                                Collections.singletonList(InputEvent.class.getName()));
+                                        new Class<?>[] {Event.class, RunnerContext.class}),
+                                Collections.singletonList(InputEvent.EVENT_TYPE));
                 actionsByEvent.put(
-                        InputEvent.class.getName(), Collections.singletonList(exceptionAction));
+                        InputEvent.EVENT_TYPE, Collections.singletonList(exceptionAction));
                 actions.put(exceptionAction.getName(), exceptionAction);
 
                 return new AgentPlan(actions, actionsByEvent, new HashMap<>());
@@ -1762,7 +1950,7 @@ public class ActionExecutionOperatorTest {
          * Action that uses durableExecute and does NOT catch the exception. This simulates the
          * behavior of built-in actions like ChatModelAction.
          */
-        public static void durableExceptionUncaughtAction(InputEvent event, RunnerContext context) {
+        public static void durableExceptionUncaughtAction(Event event, RunnerContext context) {
             try {
                 context.durableExecute(
                         durableCallable(
@@ -1790,7 +1978,7 @@ public class ActionExecutionOperatorTest {
          * Action that uses durableExecuteAsync and does NOT catch the exception. This simulates
          * async operations that fail.
          */
-        public static void durableAsyncExceptionAction(InputEvent event, RunnerContext context) {
+        public static void durableAsyncExceptionAction(Event event, RunnerContext context) {
             try {
                 context.durableExecuteAsync(
                         durableCallable(
@@ -1816,10 +2004,10 @@ public class ActionExecutionOperatorTest {
                                 new JavaFunction(
                                         TestAgent.class,
                                         "durableExceptionUncaughtAction",
-                                        new Class<?>[] {InputEvent.class, RunnerContext.class}),
-                                Collections.singletonList(InputEvent.class.getName()));
+                                        new Class<?>[] {Event.class, RunnerContext.class}),
+                                Collections.singletonList(InputEvent.EVENT_TYPE));
                 actionsByEvent.put(
-                        InputEvent.class.getName(), Collections.singletonList(exceptionAction));
+                        InputEvent.EVENT_TYPE, Collections.singletonList(exceptionAction));
                 actions.put(exceptionAction.getName(), exceptionAction);
 
                 return new AgentPlan(actions, actionsByEvent, new HashMap<>());
@@ -1840,10 +2028,10 @@ public class ActionExecutionOperatorTest {
                                 new JavaFunction(
                                         TestAgent.class,
                                         "durableAsyncExceptionAction",
-                                        new Class<?>[] {InputEvent.class, RunnerContext.class}),
-                                Collections.singletonList(InputEvent.class.getName()));
+                                        new Class<?>[] {Event.class, RunnerContext.class}),
+                                Collections.singletonList(InputEvent.EVENT_TYPE));
                 actionsByEvent.put(
-                        InputEvent.class.getName(), Collections.singletonList(exceptionAction));
+                        InputEvent.EVENT_TYPE, Collections.singletonList(exceptionAction));
                 actions.put(exceptionAction.getName(), exceptionAction);
 
                 return new AgentPlan(actions, actionsByEvent, new HashMap<>());
@@ -1885,6 +2073,27 @@ public class ActionExecutionOperatorTest {
         InputEvent event = new InputEvent(input);
         Action action = agentPlan.getActions().get(actionName);
         return actionStateStore.get(key, 0L, action, event);
+    }
+
+    private static class RecordingActionStateStore extends InMemoryActionStateStore {
+        private final List<Long> prunedSeqNums = new java.util.ArrayList<>();
+
+        private RecordingActionStateStore() {
+            super(false);
+        }
+
+        @Override
+        public void pruneState(Object key, long seqNum) {
+            prunedSeqNums.add(seqNum);
+        }
+
+        private void clearPruneCalls() {
+            prunedSeqNums.clear();
+        }
+
+        private List<Long> getPrunedSeqNums() {
+            return prunedSeqNums;
+        }
     }
 
     private static void assertMailboxSizeAndRun(TaskMailbox mailbox, int expectedSize)

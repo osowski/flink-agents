@@ -93,7 +93,9 @@ class BaseEmbeddingModelSetup(Resource, ABC):
     def open(self) -> None:
         self.connection = cast(
             "BaseEmbeddingModelConnection",
-            self.get_resource(self.connection, ResourceType.EMBEDDING_MODEL_CONNECTION),
+            self.resource_context.get_resource(
+                self.connection, ResourceType.EMBEDDING_MODEL_CONNECTION
+            ),
         )
 
     def _get_connection(self) -> BaseEmbeddingModelConnection:

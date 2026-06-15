@@ -27,6 +27,7 @@ from flink_agents.plan.function import Function, JavaFunction, PythonFunction
 
 _CONFIG_TYPE = "__config_type__"
 
+
 class Action(BaseModel):
     """Representation of an agent action with event listening and function execution.
 
@@ -42,6 +43,7 @@ class Action(BaseModel):
     listen_event_types : List[str]
         List of event types that will trigger this Action's execution.
     """
+
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     name: str
@@ -70,15 +72,25 @@ class Action(BaseModel):
     @model_validator(mode="before")
     def __custom_deserialize(self) -> "Action":
         config = self["config"]
-        if config is not None and _CONFIG_TYPE in config:
-            self["config"].pop(_CONFIG_TYPE)
+        if config is None or _CONFIG_TYPE not in config:
+            return self
+        config_type = self["config"].pop(_CONFIG_TYPE)
+        if config_type == "java":
             for name, value in config.items():
-                try:
-                    module = importlib.import_module(value[0])
-                    clazz = getattr(module, value[1])
-                    self["config"][name] = clazz.model_validate(value[2])
-                except Exception:  # noqa : PERF203
-                    self["config"][name] = value
+                if (
+                    isinstance(value, dict)
+                    and "@class" in value
+                    and "value" in value
+                ):
+                    self["config"][name] = value["value"]
+            return self
+        for name, value in config.items():
+            try:
+                module = importlib.import_module(value[0])
+                clazz = getattr(module, value[1])
+                self["config"][name] = clazz.model_validate(value[2])
+            except Exception:  # noqa : PERF203
+                self["config"][name] = value
         return self
 
     def __init__(

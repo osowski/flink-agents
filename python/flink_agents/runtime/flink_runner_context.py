@@ -29,7 +29,6 @@ from flink_agents.api.configuration import ReadableConfiguration
 from flink_agents.api.events.event import Event
 from flink_agents.api.memory.long_term_memory import (
     BaseLongTermMemory,
-    LongTermMemoryBackend,
     LongTermMemoryOptions,
 )
 from flink_agents.api.memory_object import MemoryType
@@ -49,10 +48,9 @@ from flink_agents.runtime.flink_metric_group import FlinkMetricGroup
 from flink_agents.runtime.memory.internal_base_long_term_memory import (
     InternalBaseLongTermMemory,
 )
-from flink_agents.runtime.memory.vector_store_long_term_memory import (
-    VectorStoreLongTermMemory,
+from flink_agents.runtime.memory.mem0.mem0_long_term_memory import (
+    Mem0LongTermMemory,
 )
-from flink_agents.runtime.python_java_utils import _build_event_log_string
 from flink_agents.runtime.resource_cache import ResourceCache
 
 logger = logging.getLogger(__name__)
@@ -205,7 +203,9 @@ class _ReconcilerDurableAsyncExecutionResult(AsyncExecutionResult):
         )
 
         if plan.mode == "replay":
-            result = self._ctx._replay_terminal_call(self._func, self._args, self._kwargs)
+            result = self._ctx._replay_terminal_call(
+                self._func, self._args, self._kwargs
+            )
             if False:
                 yield
             return result
@@ -289,22 +289,30 @@ class FlinkRunnerContext(RunnerContext):
     def send_event(self, event: Event) -> None:
         """Send an event to the agent for processing.
 
+        All events are serialized as JSON and sent via ``sendEventJson``
+        so that any language can reconstruct them.
+
         Parameters
         ----------
         event : Event
             The event to be processed by the agent system.
         """
-        class_path = f"{event.__class__.__module__}.{event.__class__.__qualname__}"
-        event_bytes = cloudpickle.dumps(event)
-        event_json_str = _build_event_log_string(event, class_path)
+        event_json = event.model_dump_json()
         try:
-            self._j_runner_context.sendEvent(class_path, event_bytes, event_json_str)
+            self._j_runner_context.sendEventJson(event_json)
         except Exception as e:
-            err_msg = "Failed to send event " + class_path + " to runner context"
+            err_msg = (
+                "Failed to send event '"
+                + event.get_type()
+                + "' to runner context: "
+                + event_json
+            )
             raise RuntimeError(err_msg) from e
 
     @override
-    def get_resource(self, name: str, type: ResourceType, metric_group: MetricGroup = None) -> Resource:
+    def get_resource(
+        self, name: str, type: ResourceType, metric_group: MetricGroup = None
+    ) -> Resource:
         self._j_runner_context.checkMailboxThread()
         resource = self.__resource_cache.get_resource(name, type)
         # Bind metric group to the resource
@@ -492,7 +500,9 @@ class FlinkRunnerContext(RunnerContext):
             function_id=function_id,
             args_digest=args_digest,
             status=status,
-            result_payload=bytes(result_payload) if result_payload is not None else None,
+            result_payload=bytes(result_payload)
+            if result_payload is not None
+            else None,
             exception_payload=(
                 bytes(exception_payload) if exception_payload is not None else None
             ),
@@ -763,22 +773,36 @@ def create_flink_runner_context(
     ctx = FlinkRunnerContext(
         j_runner_context, agent_plan_json, executor, j_resource_adapter
     )
-
-    backend = ctx.config.get(LongTermMemoryOptions.BACKEND)
-    # use external vector store based long term memory
-    if backend == LongTermMemoryBackend.EXTERNAL_VECTOR_STORE:
-        vector_store_name = ctx.config.get(
-            LongTermMemoryOptions.EXTERNAL_VECTOR_STORE_NAME
-        )
-        ctx.set_long_term_memory(
-            VectorStoreLongTermMemory(
-                ctx=ctx,
-                vector_store=vector_store_name,
-                job_id=job_identifier,
-            )
-        )
-
+    ltm = _init_long_term_memory(ctx, job_identifier)
+    if ltm is not None:
+        ctx.set_long_term_memory(ltm)
     return ctx
+
+
+def _init_long_term_memory(
+    ctx: FlinkRunnerContext, job_id: str
+) -> Mem0LongTermMemory | None:
+    """Build a :class:`Mem0LongTermMemory` from ``LongTermMemoryOptions``,
+    or return ``None`` if any of the three LTM resource options is missing.
+    """
+    chat_model_name = ctx.config.get(LongTermMemoryOptions.Mem0.CHAT_MODEL_SETUP)
+    embedding_model_name = ctx.config.get(
+        LongTermMemoryOptions.Mem0.EMBEDDING_MODEL_SETUP
+    )
+    vector_store_name = ctx.config.get(LongTermMemoryOptions.Mem0.VECTOR_STORE)
+    if (
+        chat_model_name is None
+        or embedding_model_name is None
+        or vector_store_name is None
+    ):
+        return None
+    return Mem0LongTermMemory(
+        ctx=ctx,
+        job_id=job_id,
+        chat_model_name=chat_model_name,
+        embedding_model_name=embedding_model_name,
+        vector_store_name=vector_store_name,
+    )
 
 
 def flink_runner_context_switch_action_context(
@@ -793,6 +817,7 @@ def flink_runner_context_switch_action_context(
     if ctx.long_term_memory is not None:
         ctx.long_term_memory.switch_context(str(key))
 
+
 def close_flink_runner_context(
     ctx: FlinkRunnerContext,
 ) -> None:
@@ -804,7 +829,9 @@ def create_async_thread_pool(max_workers: int | None) -> ThreadPoolExecutor:
     """Used to create a thread pool to execute asynchronous
     code block in action.
     """
-    logging.info(f"Initialize fixed thread pool for async task with {max_workers} threads")
+    logging.info(
+        f"Initialize fixed thread pool for async task with {max_workers} threads"
+    )
     return ThreadPoolExecutor(max_workers=max_workers or os.cpu_count() * 2)
 
 

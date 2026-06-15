@@ -18,9 +18,11 @@
 import importlib
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, Dict, Type
+from typing import TYPE_CHECKING, Any, Dict, Type
 
-from pydantic import BaseModel, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
+
+from flink_agents.api.resource_context import ResourceContext
 
 if TYPE_CHECKING:
     from flink_agents.api.metric_group import MetricGroup
@@ -30,7 +32,7 @@ class ResourceType(Enum):
     """Type enum of resource.
 
     Currently, support chat_model, chat_model_server, tool, embedding_model,
-    vector_store and prompt.
+    vector_store, prompt, mcp_server, skills.
     """
 
     CHAT_MODEL = "chat_model"
@@ -41,6 +43,7 @@ class ResourceType(Enum):
     VECTOR_STORE = "vector_store"
     PROMPT = "prompt"
     MCP_SERVER = "mcp_server"
+    SKILLS = "skills"
 
 
 class Resource(BaseModel, ABC):
@@ -52,14 +55,13 @@ class Resource(BaseModel, ABC):
 
     Attributes:
     ----------
-    get_resource : Callable[[str, ResourceType], "Resource"]
+    resource_context : ResourceContext
         Get other resource object declared in the same Agent. The first argument is
         resource name and the second argument is resource type.
     """
 
-    get_resource: Callable[[str, ResourceType], "Resource"] = Field(
-        exclude=True, default=None
-    )
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    resource_context: ResourceContext | None = Field(exclude=True, default=None)
 
     # The metric group bound to this resource, injected in RunnerContext#get_resource
     _metric_group: "MetricGroup | None" = PrivateAttr(default=None)
@@ -274,6 +276,10 @@ class ResourceName:
             AZURE_CONNECTION = "org.apache.flink.agents.integrations.chatmodels.azureai.AzureAIChatModelConnection"
             AZURE_SETUP = "org.apache.flink.agents.integrations.chatmodels.azureai.AzureAIChatModelSetup"
 
+            # Bedrock
+            BEDROCK_CONNECTION = "org.apache.flink.agents.integrations.chatmodels.bedrock.BedrockChatModelConnection"
+            BEDROCK_SETUP = "org.apache.flink.agents.integrations.chatmodels.bedrock.BedrockChatModelSetup"
+
             # Ollama
             OLLAMA_CONNECTION = "org.apache.flink.agents.integrations.chatmodels.ollama.OllamaChatModelConnection"
             OLLAMA_SETUP = "org.apache.flink.agents.integrations.chatmodels.ollama.OllamaChatModelSetup"
@@ -284,6 +290,10 @@ class ResourceName:
 
             OPENAI_RESPONSES_CONNECTION = "org.apache.flink.agents.integrations.chatmodels.openai.OpenAIResponsesModelConnection"
             OPENAI_RESPONSES_SETUP = "org.apache.flink.agents.integrations.chatmodels.openai.OpenAIResponsesModelSetup"
+
+            # Azure OpenAI
+            AZURE_OPENAI_CONNECTION = "org.apache.flink.agents.integrations.chatmodels.openai.AzureOpenAIChatModelConnection"
+            AZURE_OPENAI_SETUP = "org.apache.flink.agents.integrations.chatmodels.openai.AzureOpenAIChatModelSetup"
 
     class EmbeddingModel:
         """EmbeddingModel resource names."""
@@ -311,11 +321,19 @@ class ResourceName:
             OLLAMA_CONNECTION = "org.apache.flink.agents.integrations.embeddingmodels.ollama.OllamaEmbeddingModelConnection"
             OLLAMA_SETUP = "org.apache.flink.agents.integrations.embeddingmodels.ollama.OllamaEmbeddingModelSetup"
 
+            # Bedrock
+            BEDROCK_CONNECTION = "org.apache.flink.agents.integrations.embeddingmodels.bedrock.BedrockEmbeddingModelConnection"
+            BEDROCK_SETUP = "org.apache.flink.agents.integrations.embeddingmodels.bedrock.BedrockEmbeddingModelSetup"
+
     class VectorStore:
         """VectorStore resource names."""
 
         # Chroma
         CHROMA_VECTOR_STORE = "flink_agents.integrations.vector_stores.chroma.chroma_vector_store.ChromaVectorStore"
+
+        # Mem0 (gateway to Mem0's native vector stores: pgvector, milvus, qdrant,
+        # redis, ...)
+        MEM0_VECTOR_STORE = "flink_agents.integrations.vector_stores.mem0.mem0_vector_store.Mem0VectorStore"
 
         # Java Wrapper
         JAVA_WRAPPER_VECTOR_STORE = (
@@ -328,6 +346,15 @@ class ResourceName:
 
             # Elasticsearch
             ELASTICSEARCH_VECTOR_STORE = "org.apache.flink.agents.integrations.vectorstores.elasticsearch.ElasticsearchVectorStore"
+
+            # Amazon OpenSearch (Serverless or Service domains)
+            OPENSEARCH_VECTOR_STORE = "org.apache.flink.agents.integrations.vectorstores.opensearch.OpenSearchVectorStore"
+
+            # Amazon S3 Vectors
+            S3_VECTORS_VECTOR_STORE = "org.apache.flink.agents.integrations.vectorstores.s3vectors.S3VectorsVectorStore"
+
+            # Milvus
+            MILVUS_VECTOR_STORE = "org.apache.flink.agents.integrations.vectorstores.milvus.MilvusVectorStore"
 
     # MCP resource names
     MCP_SERVER = "flink_agents.integrations.mcp.mcp.MCPServer"

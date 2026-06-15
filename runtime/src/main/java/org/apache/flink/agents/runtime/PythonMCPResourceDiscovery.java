@@ -70,16 +70,7 @@ public class PythonMCPResourceDiscovery {
             PythonResourceProvider provider = (PythonResourceProvider) rp;
             provider.setPythonResourceAdapter(adapter);
 
-            PythonMCPServer server =
-                    (PythonMCPServer)
-                            provider.provide(
-                                    (name, type) -> {
-                                        try {
-                                            return cache.getResource(name, type);
-                                        } catch (Exception e) {
-                                            throw new RuntimeException(e);
-                                        }
-                                    });
+            PythonMCPServer server = (PythonMCPServer) provider.provide(cache.getResourceContext());
 
             for (PythonMCPTool tool : server.listTools()) {
                 cache.put(tool.getName(), TOOL, tool);

@@ -25,9 +25,8 @@ import org.apache.flink.agents.api.RetryExecutor;
 import org.apache.flink.agents.api.chat.messages.ChatMessage;
 import org.apache.flink.agents.api.chat.messages.MessageRole;
 import org.apache.flink.agents.api.chat.model.BaseChatModelConnection;
-import org.apache.flink.agents.api.resource.Resource;
+import org.apache.flink.agents.api.resource.ResourceContext;
 import org.apache.flink.agents.api.resource.ResourceDescriptor;
-import org.apache.flink.agents.api.resource.ResourceType;
 import org.apache.flink.agents.api.tools.Tool;
 import org.apache.flink.agents.api.tools.ToolMetadata;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
@@ -55,7 +54,6 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 
 /**
@@ -95,8 +93,8 @@ public class BedrockChatModelConnection extends BaseChatModelConnection {
     private final RetryExecutor retryExecutor;
 
     public BedrockChatModelConnection(
-            ResourceDescriptor descriptor, BiFunction<String, ResourceType, Resource> getResource) {
-        super(descriptor, getResource);
+            ResourceDescriptor descriptor, ResourceContext resourceContext) {
+        super(descriptor, resourceContext);
 
         String region = descriptor.getArgument("region");
         if (region == null || region.isBlank()) {
@@ -121,8 +119,8 @@ public class BedrockChatModelConnection extends BaseChatModelConnection {
 
     @Override
     public ChatMessage chat(
-            List<ChatMessage> messages, List<Tool> tools, Map<String, Object> arguments) {
-        String modelId = resolveModel(arguments);
+            List<ChatMessage> messages, List<Tool> tools, Map<String, Object> modelParams) {
+        String modelId = resolveModel(modelParams);
 
         List<ChatMessage> systemMsgs =
                 messages.stream()
@@ -156,14 +154,14 @@ public class BedrockChatModelConnection extends BaseChatModelConnection {
         }
 
         // Inference config: temperature and max_tokens
-        if (arguments != null) {
+        if (modelParams != null) {
             InferenceConfiguration.Builder inferenceBuilder = null;
-            Object temp = arguments.get("temperature");
+            Object temp = modelParams.get("temperature");
             if (temp instanceof Number) {
                 inferenceBuilder = InferenceConfiguration.builder();
                 inferenceBuilder.temperature(((Number) temp).floatValue());
             }
-            Object maxTokens = arguments.get("max_tokens");
+            Object maxTokens = modelParams.get("max_tokens");
             if (maxTokens instanceof Number) {
                 if (inferenceBuilder == null) {
                     inferenceBuilder = InferenceConfiguration.builder();
@@ -180,12 +178,14 @@ public class BedrockChatModelConnection extends BaseChatModelConnection {
         ConverseResponse response =
                 retryExecutor.execute(() -> client.converse(request), "BedrockConverse");
 
+        ChatMessage result = convertResponse(response);
         if (response.usage() != null) {
-            recordTokenMetrics(
-                    modelId, response.usage().inputTokens(), response.usage().outputTokens());
+            result.getExtraArgs().put("model_name", modelId);
+            result.getExtraArgs().put("promptTokens", response.usage().inputTokens().longValue());
+            result.getExtraArgs()
+                    .put("completionTokens", response.usage().outputTokens().longValue());
         }
-
-        return convertResponse(response);
+        return result;
     }
 
     private static boolean isRetryable(Exception e) {
@@ -202,8 +202,8 @@ public class BedrockChatModelConnection extends BaseChatModelConnection {
         this.client.close();
     }
 
-    private String resolveModel(Map<String, Object> arguments) {
-        String model = arguments != null ? (String) arguments.get("model") : null;
+    private String resolveModel(Map<String, Object> modelParams) {
+        String model = modelParams != null ? (String) modelParams.get("model") : null;
         if (model == null || model.isBlank()) {
             model = this.defaultModel;
         }

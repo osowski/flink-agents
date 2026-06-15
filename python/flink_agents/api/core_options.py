@@ -82,6 +82,32 @@ class ErrorHandlingStrategy(Enum):
     IGNORE = "ignore"
 
 
+class ShortTermMemoryTtlUpdate(Enum):
+    """Update policy for short-term memory TTL."""
+
+    ON_CREATE_AND_WRITE = "ON_CREATE_AND_WRITE"
+    ON_READ_AND_WRITE = "ON_READ_AND_WRITE"
+
+
+class ShortTermMemoryTtlVisibility(Enum):
+    """Visibility policy for expired short-term memory state."""
+
+    NEVER_RETURN_EXPIRED = "NEVER_RETURN_EXPIRED"
+    RETURN_EXPIRED_IF_NOT_CLEANED_UP = "RETURN_EXPIRED_IF_NOT_CLEANED_UP"
+
+
+class LoggerType(Enum):
+    """Built-in event logger types.
+
+    Mirrors the Java ``LoggerType`` enum so Python users can configure the
+    logger type via ``AgentConfigOptions.EVENT_LOGGER_TYPE`` without using
+    raw strings.
+    """
+
+    SLF4J = "slf4j"
+    FILE = "file"
+
+
 class AgentConfigOptions(metaclass=AgentConfigOptionsMeta):
     """CoreOptions to manage core configuration parameters for Flink Agents."""
 
@@ -89,6 +115,37 @@ class AgentConfigOptions(metaclass=AgentConfigOptionsMeta):
         key="job-identifier",
         config_type=str,
         default=None,
+    )
+
+    EVENT_LOGGER_TYPE = ConfigOption(
+        key="eventLoggerType",
+        config_type=LoggerType,
+        default=LoggerType.SLF4J,
+    )
+
+    # Event log level config options
+    EVENT_LOG_LEVEL = ConfigOption(
+        key="event-log.level",
+        config_type=str,
+        default="STANDARD",
+    )
+
+    EVENT_LOG_MAX_STRING_LENGTH = ConfigOption(
+        key="event-log.standard.max-string-length",
+        config_type=int,
+        default=2000,
+    )
+
+    EVENT_LOG_MAX_ARRAY_ELEMENTS = ConfigOption(
+        key="event-log.standard.max-array-elements",
+        config_type=int,
+        default=20,
+    )
+
+    EVENT_LOG_MAX_DEPTH = ConfigOption(
+        key="event-log.standard.max-depth",
+        config_type=int,
+        default=5,
     )
 
 
@@ -135,4 +192,27 @@ class AgentExecutionOptions:
         key="rag.async",
         config_type=bool,
         default=True,
+    )
+
+    # Set to a positive value in milliseconds to enable short-term memory TTL;
+    # 0 disables it.
+    SHORT_TERM_MEMORY_STATE_TTL_MS = ConfigOption(
+        key="short-term-memory.state-ttl.ms",
+        config_type=int,
+        default=0,
+    )
+
+    # Update policy for short-term memory TTL, consulted only when TTL is enabled.
+    SHORT_TERM_MEMORY_STATE_TTL_UPDATE_TYPE = ConfigOption(
+        key="short-term-memory.state-ttl.update-type",
+        config_type=ShortTermMemoryTtlUpdate,
+        default=ShortTermMemoryTtlUpdate.ON_READ_AND_WRITE,
+    )
+
+    # Visibility policy for expired short-term memory state, consulted only when TTL
+    # is enabled.
+    SHORT_TERM_MEMORY_STATE_TTL_VISIBILITY = ConfigOption(
+        key="short-term-memory.state-ttl.visibility",
+        config_type=ShortTermMemoryTtlVisibility,
+        default=ShortTermMemoryTtlVisibility.NEVER_RETURN_EXPIRED,
     )
